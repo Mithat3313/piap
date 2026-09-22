@@ -450,6 +450,24 @@ def main():
             SESS.drop(p); log(f'{p}: disconnected, session dropped')
     bus.add_signal_receiver(on_props, dbus_interface=DBUS_PROP, signal_name='PropertiesChanged', path_keyword='path')
 
+    # ---- links that survived our restart are stale by definition: this process re-registered the GATT
+    # application, so the client's cached handles no longer match and its writes would go nowhere. Drop them
+    # once, right after startup, so the client reconnects against the current database.
+    def drop_preexisting():
+        try:
+            objs = dbus.Interface(bus.get_object(BLUEZ, '/'), DBUS_OM).GetManagedObjects()
+        except Exception as e:
+            log('startup scan error', e); return False
+        for p, ifaces in objs.items():
+            d = ifaces.get(IFACE_DEVICE)
+            if d and bool(d.get('Connected')):
+                try:
+                    dbus.Interface(bus.get_object(BLUEZ, p), IFACE_DEVICE).Disconnect()
+                    log(f'{p}: link from before the restart dropped (stale GATT handles)')
+                except Exception as e: log('startup disconnect error', e)
+        return False
+    GLib.timeout_add_seconds(2, drop_preexisting)
+
     loop = GLib.MainLoop()
     try: loop.run()
     except KeyboardInterrupt: pass

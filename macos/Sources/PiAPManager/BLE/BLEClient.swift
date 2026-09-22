@@ -148,6 +148,11 @@ final class BLEClient: NSObject, ObservableObject {
             let w = DispatchWorkItem { [weak self] in
                 guard let self, let c = self.pending.removeValue(forKey: id) else { return }
                 self.note("id=\(id) \(op): timed out"); c.resume(throwing: BLEError.timeout)
+                // The Pi acks every long operation, so a timeout means the link is dead — usually because the
+                // agent restarted and our cached GATT handles went stale. Drop it instead of spinning forever;
+                // the connect screen comes back and a fresh connection rebuilds the handles.
+                self.disconnect()
+                self.state = .error("no answer from the Pi — disconnected, connect again")
             }
             pendingTimers[id] = w
             DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: w)
