@@ -105,6 +105,19 @@ mkchain nat AP-VPN-POST;   mkchain nat AP-VPN-PRE
 mkchain mangle AP-VPN-MSS
 $SYSCTL -qw net.ipv4.ip_forward=1
 
+# ---- GUARD: the rewrite is not instantaneous. Deleting our old ip rules and flushing AP-VPN-FWD
+# leaves a window of hundreds of milliseconds in which a vpn slot has neither its blackhole nor its
+# DROP rule: the packet would fall through to table main and out of the LAN - the exact leak this
+# project exists to prevent. So every enabled AP subnet is blackholed at a priority ABOVE our normal
+# rules for the whole rewrite. Guests lose traffic for that moment; nothing escapes. The guard is
+# removed only after the self-check has passed, and deliberately left in place on every failure path.
+PRIO_GUARD=999
+for f in $SLOT_FILES; do
+  grep -q '^ENABLED=1' "$f" || continue
+  gnet=$(sed -n 's/^AP_NET=//p' "$f" | head -1)
+  [ -n "$gnet" ] && $IP rule add from "$gnet" blackhole priority "$PRIO_GUARD" 2>/dev/null
+done
+
 # clear our old rules (every "from ... lookup/blackhole" rule in our priority range)
 $IP rule show | awk -F: '$1>=1000 && $1<2000 {print $1}' | sort -u | while read -r pref; do
   while $IP rule del pref "$pref" 2>/dev/null; do :; done
@@ -186,6 +199,15 @@ $IPT -A AP-VPN-IN -i wg+ -p icmp --icmp-type echo-request -j ACCEPT
 $IPT -A AP-VPN-IN -i wg+ -m conntrack --ctstate NEW -j DROP
 
 # ------------------------------------------------------------- 3. hook up
+# AP-VPN-FWD hangs off DOCKER-USER so Docker cannot push its own rules in front of ours. That chain
+# belongs to Docker, but it only exists once dockerd has run: on a Pi without Docker nothing would
+# create it and every rule in the filter layer would be unreachable. Create and hook it ourselves when
+# it is missing - never flush it, since Docker's own rules live there when Docker is installed.
+if ! $IPT -t filter -nL DOCKER-USER >/dev/null 2>&1; then
+  $IPT -t filter -N DOCKER-USER 2>/dev/null || die "could not create the DOCKER-USER chain"
+  hook filter FORWARD DOCKER-USER
+  logger -t ap-firewall "DOCKER-USER did not exist (no Docker) - created it and hooked it into FORWARD"
+fi
 hook filter DOCKER-USER AP-VPN-FWD
 hook filter INPUT       AP-VPN-IN
 hook nat    POSTROUTING AP-VPN-POST
@@ -253,6 +275,9 @@ if [ -n "$fail" ]; then
   logger -t ap-firewall -p daemon.err "self-check failed:$fail - forwarding torn down for every AP (fail closed)"
   die "self-check failed:$fail (all AP forwarding was dropped)"
 fi
+# Everything is in place and verified: lift the guard. Any failure above returns before this point,
+# so a half-applied rule set always stays behind the blackhole.
+for _i in 1 2 3 4 5 6 7 8; do $IP rule del pref "$PRIO_GUARD" 2>/dev/null || break; done
 logger -t ap-firewall "rules applied, slots:$ACTIVE"
 echo "ap-firewall: OK slots:$ACTIVE"
 exit 0

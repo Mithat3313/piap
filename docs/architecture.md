@@ -62,6 +62,8 @@ DNS: the client asks `10.99.0.1:53` (DHCP says so; if it asks any other address,
 
 ## Two subtleties in the routing table
 
+**The rewrite is not instantaneous.** `ap-firewall` deletes its old `ip rule` entries and flushes `AP-VPN-FWD` before writing the new ones. For those hundreds of milliseconds a `vpn` slot would have neither its blackhole nor its DROP rule, and a packet could fall through to `main` and out of the LAN. So the run starts by blackholing every enabled AP subnet at priority 999 — above all the normal rules — and lifts that guard only after the self-check has passed. Guests lose traffic for the length of the rewrite; nothing escapes. Every failure path leaves the guard in place, and the watchdog re-runs the firewall a minute later.
+
 **Blackhole.** After an `ip rule` selects a table, if the table is empty (the tunnel interface was deleted, so its routes went with it), rule evaluation **continues** and the packet falls through to `main` — that is, to the home connection. What prevents this is `ip rule 1002: from 10.99.0.0/24 blackhole`, placed right after the table rule. When the table empties, the packet dies here.
 
 **AP link route inside the table.** The rule `from 10.99.0.0/24 lookup 51820` also matches the Pi's own AP address (`10.99.0.1`). dnsmasq's DHCP/DNS replies leave from that address; if the table only held `default dev wg0`, the replies would go into the tunnel and the client would see "connected, no internet". That is why `ap-firewall` writes the link route `10.99.0.0/24 dev wlan0` into the table before the default route.
@@ -79,7 +81,7 @@ Docker sets up its own chains through `iptables-nft` and may recreate `DOCKER-US
 - orders `ap-firewall.service` `After=docker.service`;
 - **refuses to run** if `nftables.service` is enabled: `/etc/nftables.conf` starts with `flush ruleset`, which wipes all of Docker's tables and the kill switch.
 
-Without Docker, `ap-firewall` creates the `DOCKER-USER` chain itself and hooks it into `FORWARD` directly.
+Without Docker the chain simply does not exist, so `ap-firewall` creates it and hooks it into `FORWARD` itself (it never flushes it: when Docker is installed, Docker's own rules live there). Everything in the filter layer hangs off that one jump, so a missing chain would quietly make all of it unreachable.
 
 ## Self-check and the structural kill switch
 

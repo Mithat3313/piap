@@ -59,6 +59,12 @@ fi
 ip route get "$AP_TEST_SRC" from "$AP_GW" 2>&1 | grep -q "dev $AP_IF" \
   && P "AP->AP replies stay on $AP_IF" || F "AP->AP replies take the wrong path"
 $IPT -C DOCKER-USER -j AP-VPN-FWD 2>/dev/null && P "DOCKER-USER -> AP-VPN-FWD hooked" || F "DOCKER-USER hook MISSING"
+$IPT -C FORWARD -j DOCKER-USER 2>/dev/null || command -v docker >/dev/null 2>&1 \
+  && P "the DOCKER-USER chain is reachable from FORWARD" \
+  || F "DOCKER-USER is not reachable from FORWARD - every filter rule below it is dead"
+$IP rule show | grep -q "^999:" \
+  && F "a rewrite guard (priority 999) was left behind - the last ap-firewall run did not finish" \
+  || P "no leftover rewrite guard"
 $IPT -C AP-VPN-FWD -i "$AP_IF" -j DROP 2>/dev/null && P "kill-switch filter rule present" || F "kill-switch filter rule MISSING"
 $IPT -t nat -C AP-VPN-POST -s "$AP_NET" -o "$EXIT_IF" -j MASQUERADE 2>/dev/null \
   && P "masquerade present ($EXIT_IF)" || F "masquerade MISSING - the far end drops packets from $AP_NET"

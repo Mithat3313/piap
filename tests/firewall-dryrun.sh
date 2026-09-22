@@ -40,16 +40,23 @@ EOF
   # ---- mocks -------------------------------------------------------------
   cat > "$R/bin/iptables" <<EOF
 #!/bin/bash
-# records -A/-I rules, answers -C from the record, prints them for -S
+# Models the parts of iptables this script depends on, INCLUDING the rule that a chain must exist
+# before anything can be added to, checked in or listed from it. (Not modelling that is what let a
+# missing DOCKER-USER chain pass unnoticed.) Built-in chains exist from the start.
 S=$R/state/ipt; t=filter; a=(); mode=add
+builtin(){ case "\$1" in INPUT|FORWARD|OUTPUT|PREROUTING|POSTROUTING) return 0;; *) return 1;; esac; }
+exists(){ builtin "\$1" || grep -qxF "chain \$t \$1" "\$S" 2>/dev/null; }
+need(){ exists "\$1" || { echo "iptables: No chain/target/match by that name." >&2; exit 1; }; }
 while [ \$# -gt 0 ]; do case "\$1" in
   -t) t=\$2; shift 2;;
-  -C) mode=check; a+=("\$2"); shift 2;;
-  -A|-I) mode=add; a+=("\$2"); shift 2; [ "\${1:-}" = 1 ] && shift;;
-  -N) grep -qxF "chain \$t \$2" "\$S" 2>/dev/null && exit 1     # real iptables refuses an existing chain
+  -C) mode=check; need "\$2"; a+=("\$2"); shift 2;;
+  -A|-I) mode=add; need "\$2"; a+=("\$2"); shift 2; [ "\${1:-}" = 1 ] && shift;;
+  -N) exists "\$2" && exit 1                                   # real iptables refuses an existing chain
       echo "chain \$t \$2" >> "\$S"; exit 0;;
-  -F) grep -v "^\$t \$2 " "\$S" 2>/dev/null > "\$S.t" || true; mv -f "\$S.t" "\$S" 2>/dev/null; exit 0;;
-  -S) grep "^\$t \$2 " "\$S" 2>/dev/null | cut -d' ' -f3-; exit 0;;
+  -nL|-L) exists "\$2"; exit \$?;;
+  -F) need "\$2"; grep -v "^\$t \$2 " "\$S" 2>/dev/null > "\$S.t" || true; mv -f "\$S.t" "\$S" 2>/dev/null
+      echo "chain \$t \$2" >> "\$S"; exit 0;;
+  -S) need "\$2"; grep "^\$t \$2 " "\$S" 2>/dev/null | cut -d' ' -f3-; exit 0;;
   *) a+=("\$1"); shift;;
 esac; done
 line="\$t \${a[*]}"
@@ -121,7 +128,7 @@ EOF
 
 # =============================================================== 1. vpn + direct side by side
 echo "== scenario 1: ap0 = vpn (tunnel up), ap1 = direct (no tunnel) =="
-setup /tmp/piap-fw-1; touch "$R/wg0_up"
+setup /tmp/piap-fw-1; touch "$R/wg0_up"; echo "filter DOCKER-USER" > "$R/state/ipt"   # Docker is installed here
 slot ap0 wlan0 10.99.0 0 vpn hetzner
 slot ap1 wlan1 10.98.0 1 direct
 rc=$(run_fw); I=$R/state/ipt; RU=$R/state/rules; RO=$R/state/routes
@@ -223,6 +230,46 @@ rc=$(FAIL_CHECK="AP-VPN-FWD -i wlan0 -o wg0 -j ACCEPT" run_fw); I=$R/state/ipt
 grep -q "AP-VPN-FWD -i wlan0 -o wg0 -j ACCEPT" "$I" && no "the rejected rule set is still live" || ok "the rejected rule set was torn down"
 has "filter AP-VPN-FWD -i wlan0 -j DROP" "$I" "every AP interface is dropped instead (fail closed)"
 grep -q "nat AP-VPN-POST .*MASQUERADE" "$I" && no "NAT survived the teardown" || ok "NAT was removed with it"
+
+# =============================================================== 8. a Pi without Docker
+echo
+echo "== scenario 8: no Docker on the box (DOCKER-USER does not exist) =="
+setup /tmp/piap-fw-8; touch "$R/wg0_up"          # note: DOCKER-USER is NOT pre-created
+slot ap0 wlan0 10.99.0 0 vpn hetzner
+rc=$(run_fw); I=$R/state/ipt
+[ "$rc" = 0 ] && ok "the firewall applies without Docker" || no "firewall exited $rc: $(cat "$R/err")"
+grep -q "^chain filter DOCKER-USER" "$I" && ok "the chain was created" || no "DOCKER-USER was not created"
+has "filter FORWARD -j DOCKER-USER"              "$I" "and hooked into FORWARD, so our chain is reachable"
+has "filter DOCKER-USER -j AP-VPN-FWD"           "$I" "AP-VPN-FWD hangs off it"
+has "filter AP-VPN-FWD -i wlan0 -j DROP"         "$I" "the kill switch is in a reachable chain"
+
+echo
+echo "== scenario 9: Docker's own rules in DOCKER-USER survive =="
+setup /tmp/piap-fw-9; touch "$R/wg0_up"
+printf 'chain filter DOCKER-USER
+filter DOCKER-USER -j RETURN
+' > "$R/state/ipt"
+slot ap0 wlan0 10.99.0 0 vpn hetzner
+rc=$(run_fw); I=$R/state/ipt
+[ "$rc" = 0 ] && ok "applied with Docker present" || no "firewall exited $rc: $(cat "$R/err")"
+has "filter DOCKER-USER -j RETURN" "$I" "Docker's own rule is untouched (the chain is never flushed)"
+
+# =============================================================== 10. the rewrite itself is fail-closed
+echo
+echo "== scenario 10: the guard that covers the rewrite window =="
+setup /tmp/piap-fw-10; touch "$R/wg0_up"
+slot ap0 wlan0 10.99.0 0 vpn hetzner
+rc=$(run_fw); RU=$R/state/rules
+[ "$rc" = 0 ] && ok "run succeeded" || no "firewall exited $rc"
+grep -q "^999:" "$RU" && no "the guard was left behind after a good run" || ok "the guard is lifted once everything verified"
+has "10.99.0.0/24 blackhole" "$RU" "the normal blackhole rule is in place"
+# now make the self-check fail: the guard must STAY, so nothing can leak through the rejected state
+setup /tmp/piap-fw-11; touch "$R/wg0_up"
+slot ap0 wlan0 10.99.0 0 vpn hetzner
+rc=$(FAIL_CHECK="AP-VPN-FWD -i wlan0 -o wg0 -j ACCEPT" run_fw); RU=$R/state/rules; I=$R/state/ipt
+[ "$rc" != 0 ] && ok "a rejected run exits non-zero" || no "the failure was not reported"
+grep -q "^999:.*10.99.0.0/24 blackhole" "$RU" && ok "the guard STAYS after a rejected run (guests stay blackholed)" \
+  || no "the guard was lifted despite the failure - traffic could fall through to the LAN"
 
 echo
 printf -- '---- %d PASS, %d FAIL ----\n' "$pass" "$fail"
