@@ -43,6 +43,10 @@ for f in "$S"/*.env; do [ -r "$f" ] || continue
   [ "$(sed -n 's/^AP_MAC=//p' "$f" | head -1)" = "$AP_MAC" ] && die "that radio ($AP_MAC) already belongs to slot $(basename "$f" .env)"
 done
 /usr/sbin/iw dev "$AP_IF" info >/dev/null 2>&1 || die "$AP_IF is not usable"
+# The identity must be the adapter's permanent address. addr_assign_type != 0 means the kernel (or
+# NetworkManager) generated it, and it would change on the next boot, silently unbinding the slot.
+AAT=$(cat "/sys/class/net/$AP_IF/addr_assign_type" 2>/dev/null || echo 0)
+[ "$AAT" = 0 ] || die "$AP_IF uses a generated MAC ($AP_MAC, addr_assign_type=$AAT); disable MAC randomization for it first, otherwise the slot would lose its radio at the next boot"
 
 . /etc/ap-vpn/ap.env
 [ "$AP_IF" != "$LAN_IF" ] || die "the AP interface cannot be the LAN interface"

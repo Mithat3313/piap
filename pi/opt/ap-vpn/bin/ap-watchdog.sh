@@ -24,8 +24,8 @@ LASTR="$STATE/last_restart"
 # --- 0. direct slots have no tunnel: only the routing needs watching ---
 if [ "$MODE" = direct ]; then
   LAN_GW=$($IP -o -4 route show default | awk '{print $3; exit}')
-  $IP route show table "$TABLE" | grep -q "^default via" \
-    || { logger -t ap-watchdog -p daemon.warning "$SLOT (direct): no LAN default route in table $TABLE - re-applying the firewall"; /opt/ap-vpn/bin/ap-firewall.sh >/dev/null 2>&1; }
+  $IP route show table "$TABLE" | grep -q "^default via ${LAN_GW:-x} dev ${LAN_IF}" \
+    || { logger -t ap-watchdog -p daemon.warning "$SLOT (direct): the LAN default route in table $TABLE is missing or stale - re-applying the firewall"; /opt/ap-vpn/bin/ap-firewall.sh >/dev/null 2>&1; }
   $IP route show table "$TABLE" | grep -q "^${AP_NET} dev ${AP_IF}" \
     || { logger -t ap-watchdog -p daemon.warning "$SLOT (direct): AP link route missing - re-applying the firewall"; /opt/ap-vpn/bin/ap-firewall.sh >/dev/null 2>&1; }
   $IP rule show | grep -q "from ${AP_NET} blackhole" \

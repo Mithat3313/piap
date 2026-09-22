@@ -26,14 +26,21 @@ driver_of(){ basename "$(readlink -f "$SYSFS_NET/$1/device/driver" 2>/dev/null)"
 ap_capable(){ /usr/sbin/iw phy "$(cat "$SYSFS_NET/$1/phy80211/name" 2>/dev/null)" info 2>/dev/null \
   | awk '/Supported interface modes/,/^\s*[A-Z]/' | grep -q '\* AP$'; }
 
-# interface that currently carries this MAC ('' when the radio is absent)
+# interface that currently carries this MAC ('' when the radio is absent).
+# Two radios answering to one MAC (a cloned or randomized address) would make the binding a coin flip,
+# so that is refused rather than guessed.
 if_for_mac(){
-  local want=$1 i
+  local want=$1 i found=""
+  [ -n "$want" ] || return 1
   for i in "$SYSFS_NET"/*; do
     i=$(basename "$i"); is_wifi "$i" || continue
-    [ "$(mac_of "$i")" = "$want" ] && { echo "$i"; return 0; }
+    if [ "$(mac_of "$i")" = "$want" ]; then
+      [ -n "$found" ] && die "two radios carry $want ($found and $i) - refusing to guess which one is the slot's"
+      found=$i
+    fi
   done
-  return 1
+  [ -n "$found" ] || return 1
+  echo "$found"
 }
 
 # Same, but waits: at boot (and right after a re-plug) udev can take seconds to bring a USB radio up,
@@ -43,6 +50,17 @@ if_for_mac_wait(){
   for i in $(seq 1 "$n"); do
     r=$(if_for_mac "$want") && { echo "$r"; return 0; }
     sleep 0.5
+  done
+  return 1
+}
+
+# which slot's env currently names this interface (AP_IF), other than $2
+owner_of_name(){
+  local want=$1 me=${2:-} f n
+  for f in "$SLOTS"/*.env; do
+    [ -r "$f" ] || continue
+    n=$(basename "$f" .env); [ "$n" = "$me" ] && continue
+    [ "$(sed -n 's/^AP_IF=//p' "$f" | head -1)" = "$want" ] && { echo "$n"; return 0; }
   done
   return 1
 }
@@ -88,8 +106,16 @@ sync_slot(){
     owner=$(owner_of_mac "$cur" || true)
     logger -t ap-ifsync -p daemon.warning "$slot: ${AP_IF} now carries $cur${owner:+ (slot $owner)}; this slot follows its own radio to $now"
   fi
-  local other; other=$(owner_of_mac "$(mac_of "$now")" || true)
-  [ -z "$other" ] || [ "$other" = "$slot" ] || die "$slot: $now belongs to slot $other - refusing"
+  # Would we be taking a name another slot's config still points at? If that slot's OWN radio is the one
+  # sitting there, this is a genuine conflict and we stop. If it is not (two adapters traded names, so
+  # its entry is simply stale), we go ahead: that slot follows its own MAC on its next sync, and until
+  # then ap-firewall refuses to build rules for two slots on one interface.
+  local other other_mac; other=$(owner_of_name "$now" "$slot" || true)
+  if [ -n "$other" ]; then
+    other_mac=$(sed -n 's/^AP_MAC=//p' "$SLOTS/$other.env" | head -1)
+    [ "$other_mac" = "$(mac_of "$now")" ] && die "$slot: $now really belongs to slot $other - refusing"
+    logger -t ap-ifsync -p daemon.warning "$slot: taking $now from slot $other's stale entry; $other must be synced too"
+  fi
 
   set_key "$env" AP_IF "$now" || die "$slot: could not update AP_IF"
   [ -f "$HOSTAPD_DIR/$slot.conf" ] && { set_key "$HOSTAPD_DIR/$slot.conf" interface "$now" || die "$slot: could not update the hostapd config"; }
@@ -111,7 +137,8 @@ case "${1:-}" in
       i=$(basename "$i"); is_wifi "$i" || continue
       m=$(mac_of "$i"); s=$(owner_of_mac "$m" || echo '-')
       ap_capable "$i" && a=yes || a=no
-      printf '%-8s %-18s %-10s %-4s %s\n' "$i" "$m" "$(driver_of "$i")" "$a" "$s"
+      d=$(driver_of "$i"); [ -n "$d" ] && [ "$d" != . ] || d='-'
+      printf '%-8s %-18s %-10s %-4s %s\n' "$i" "$m" "$d" "$a" "$s"
     done;;
   *) echo "usage: $0 sync <slot> | name <slot> | list" >&2; exit 2;;
 esac

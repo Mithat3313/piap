@@ -49,6 +49,18 @@ if [ ! -f /etc/ap-vpn/ap.env ]; then
 else echo "  /etc/ap-vpn/ap.env already exists (left untouched)"; fi
 echo "  /opt/ap-vpn ready"
 
+echo "########## 2b) existing slots: fill in what this version expects ##########"
+# Slots written before exit modes existed have no MODE line. vpn is what they were doing, so that is
+# what they keep; nothing about their traffic changes. The pin is NOT written here - pinning is a
+# confirmed operation, and ap-verify points that out for every slot that still needs it.
+for f in /etc/ap-vpn/slots/*.env; do
+  [ -r "$f" ] || continue
+  s=$(basename "$f" .env)
+  grep -q '^MODE=' "$f" || { printf 'MODE=vpn\n' >> "$f"; echo "  $s: MODE=vpn added (unchanged behaviour)"; }
+  grep -q '^AP_MAC=.\+' "$f" || echo "  $s: no AP_MAC yet - it is bound to the interface name only; pin it with: sudo ap-ctl --slot $s slot pin --confirm '<SSID>'"
+  grep -q '^PIN_MODE=.\+' "$f" || echo "  $s: the exit mode is not pinned yet: sudo ap-ctl --slot $s slot pin --confirm '<SSID>'"
+done
+
 echo "########## 3) systemd ##########"
 install -m 0644 "$SRC"/systemd/ap-*.service "$SRC"/systemd/ap-*.timer /etc/systemd/system/
 if command -v docker >/dev/null 2>&1; then

@@ -164,8 +164,8 @@ def _radio(slot):
     try: live = open(f'/sys/class/net/{ap_if}/address').read().strip()
     except OSError: live = None
     drv = None
-    try: drv = os.path.basename(os.path.realpath(f'/sys/class/net/{ap_if}/device/driver'))
-    except OSError: pass
+    p = f'/sys/class/net/{ap_if}/device/driver'
+    if os.path.islink(p): drv = os.path.basename(os.path.realpath(p))
     return {'if': ap_if, 'mac': mac, 'live_mac': live, 'driver': drv,
             'present': live is not None and (mac is None or live == mac)}
 
@@ -405,8 +405,13 @@ def _pin_write(s):
     if prof:
         peer = _parse_conf(open(os.path.join(PROFILES, prof + '.conf')).read()).get('peer_pubkey') or ''
         if not peer: raise ApError(f'profile {prof}: no PublicKey, cannot be pinned')
-    try: mac = open(f"/sys/class/net/{s['AP_IF']}/address").read().strip()
-    except FileNotFoundError: mac = s.get('AP_MAC') or ''
+    # The MAC is the slot's identity, so it is written ONCE (when the slot is first pinned) and after an
+    # explicit 'slot bind'. Adopting whatever adapter happens to sit on AP_IF would let a foreign radio
+    # inherit this slot's subnet and tunnel through an ordinary activate/pin.
+    mac = s.get('AP_MAC') or ''
+    if not mac:
+        try: mac = open(f"/sys/class/net/{s['AP_IF']}/address").read().strip()
+        except OSError: mac = ''
     for k, v in (('PIN_MODE', s.get('MODE', 'vpn')), ('PIN_SSID_HEX', _ssid_of(s).encode().hex()),
                  ('PIN_PROFILE', prof), ('PIN_PEER', peer), ('AP_MAC', mac)):
         _set_env_key(env_path, k, v)
@@ -424,6 +429,8 @@ def _require_confirm(confirm, *affected):
     """For operations that change the SSID-VPN mapping: the affected SSIDs, joined with ' / ',
     must be typed VERBATIM. Guards against a mis-click; the system NEVER makes this change on its own."""
     expected = ' / '.join(_ssid_of(x) for x in affected)
+    if not expected.strip(' /'):
+        raise ApError('cannot read the SSID of ' + ', '.join(x['SLOT'] for x in affected) + ' - refusing to change anything')
     if str(confirm or '').strip() != expected:
         raise ApError(f'CONFIRMATION REQUIRED: this operation changes the SSID-VPN mapping. To confirm, type exactly: {expected}')
 
@@ -482,6 +489,11 @@ def _vpn_swap_impl(slot_a, slot_b, confirm=None):
     Confirmation: both SSIDs must be typed (joined with ' / ', in A B order)."""
     a, b = _slot(slot_a), _slot(slot_b)
     if a['SLOT'] == b['SLOT']: raise ApError('same slot')
+    # Refuse BEFORE touching anything: a direct slot has no tunnel to swap, and finding that out
+    # halfway would leave the other slot stripped of its profile.
+    for x in (a, b):
+        if x.get('MODE', 'vpn') != 'vpn':
+            raise ApError(f"{x['SLOT']} is in direct mode (no VPN) - nothing to swap; switch it to vpn mode first")
     pa, pb = a.get('PROFILE') or None, b.get('PROFILE') or None
     if not pa and not pb: raise ApError('neither slot has a profile')
     _require_confirm(confirm, a, b)
@@ -504,8 +516,8 @@ def devices():
     for line in out.strip().split('\n')[1:]:
         p = line.split()
         if len(p) >= 5:
-            rows.append({'if': p[0], 'mac': p[1], 'driver': p[2], 'ap_capable': p[3] == 'yes',
-                         'slot': None if p[4] == '-' else p[4]})
+            rows.append({'if': p[0], 'mac': p[1], 'driver': None if p[2] == '-' else p[2],
+                         'ap_capable': p[3] == 'yes', 'slot': None if p[4] == '-' else p[4]})
     return rows
 
 
@@ -537,21 +549,64 @@ def _slot_mode_impl(slot, mode, confirm=None):
     if mode not in ('vpn', 'direct'): raise ApError("mode must be 'vpn' or 'direct'")
     s = _slot(slot); _require_confirm(confirm, s)
     env_path = os.path.join(SLOTS_DIR, s['SLOT'] + '.env')
-    if mode == s.get('MODE', 'vpn'):
+    was = s.get('MODE', 'vpn')
+    # Repeating the command must be able to REPAIR a half-applied switch, so 'already in that mode' only
+    # short-circuits when the pin agrees too; otherwise every step below runs again (all are idempotent).
+    if mode == was and _pin_info(s)['ok'] and (s.get('PIN_MODE') or '') == mode:
         return {'slot': s['SLOT'], 'mode': mode, 'unchanged': True, 'pin': _pin_info(_slot(s['SLOT']))}
     if mode == 'direct':
         if s.get('PROFILE'): _detach_profile(s)      # stops the tunnel and clears the pin
+        # Disable it too: a unit that is merely stopped comes back at the next boot and violates the pin.
+        _run([SYSCTL, 'disable', f"wg-quick@{s['WG_IF']}"], 20)
         _set_env_key(env_path, 'MODE', 'direct')
     else:
         _set_env_key(env_path, 'MODE', 'vpn')        # no profile yet: fail closed until one is assigned
     s = _slot(s['SLOT'])
     _dnsmasq_upstream(s)
     rc, out, err = _run([FIREWALL], 60)
-    if rc != 0: raise ApError('firewall refused the new mode: ' + (err or out).strip()[-300:])
+    if rc != 0:
+        # Leave nothing half-switched: put MODE back, re-apply, and report. The firewall itself has
+        # already dropped all AP forwarding, so the slot is fail-closed either way.
+        _set_env_key(env_path, 'MODE', was); _dnsmasq_upstream(_slot(s['SLOT'])); _run([FIREWALL], 60)
+        raise ApError('firewall refused the new mode (rolled back to ' + was + '): ' + (err or out).strip()[-300:])
     _pin_write(s)
     _restart_hostapd(s); time.sleep(2)
     return {'slot': s['SLOT'], 'mode': mode, 'ssid': _ssid_of(s), 'hostapd': _active(s['HOSTAPD_UNIT']),
             'pin': _pin_info(_slot(s['SLOT']))}
+
+
+def _claim_interface(ifname):
+    """Take a radio away from NetworkManager and avahi, the way ap-slot-new.sh does for a new slot."""
+    nm = '/etc/NetworkManager/conf.d/99-ap-unmanaged.conf'
+    if os.path.isdir('/etc/NetworkManager'):
+        try:
+            txt = open(nm).read() if os.path.exists(nm) else '[keyfile]\nunmanaged-devices=\n'
+            if f'interface-name:{ifname};' not in txt + ';':
+                txt = re.sub(r'^(unmanaged-devices=)(.*)$',
+                             lambda m: m.group(1) + (m.group(2) + ';' if m.group(2) else '') +
+                                       f'interface-name:{ifname};interface-name:p2p-dev-{ifname}',
+                             txt, count=1, flags=re.M)
+                lan = _env().get('LAN_IF', 'eth0')
+                if f'interface-name:{lan}' in txt: raise ApError('refusing: the LAN interface would become unmanaged')
+                fd, tmp = tempfile.mkstemp(dir=os.path.dirname(nm)); os.write(fd, txt.encode()); os.close(fd)
+                os.chmod(tmp, 0o644); os.replace(tmp, nm)
+            _run(['/usr/bin/nmcli', 'device', 'set', ifname, 'managed', 'no'], 15)
+            _run([SYSCTL, 'reload', 'NetworkManager'], 20)
+        except ApError: raise
+        except Exception: pass
+    av = '/etc/avahi/avahi-daemon.conf'
+    if os.path.exists(av):
+        try:
+            txt = open(av).read(); m = re.search(r'^deny-interfaces=(.*)$', txt, re.M)
+            cur = [x for x in (m.group(1).split(',') if m else []) if x]
+            if ifname not in cur:
+                new = ','.join(sorted(set(cur + [ifname])))
+                txt = (re.sub(r'^deny-interfaces=.*$', lambda _m: 'deny-interfaces=' + new, txt, count=1, flags=re.M)
+                       if m else txt.replace('[server]', '[server]\ndeny-interfaces=' + new, 1))
+                fd, tmp = tempfile.mkstemp(dir=os.path.dirname(av)); os.write(fd, txt.encode()); os.close(fd)
+                os.chmod(tmp, 0o644); os.replace(tmp, av)
+                _run([SYSCTL, 'restart', 'avahi-daemon'], 20)
+        except Exception: pass
 
 
 def _slot_bind_impl(slot, target, confirm=None):
@@ -575,25 +630,44 @@ def _slot_bind_impl(slot, target, confirm=None):
             fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path)); os.write(fd, txt.encode()); os.close(fd)
             os.chmod(tmp, 0o600 if 'hostapd' in path else 0o644); os.replace(tmp, path)
     s = _slot(s['SLOT'])
-    _run([SYSCTL, 'start', f"ap-wlan@{s['SLOT']}"], 30); _run([FIREWALL], 60)
+    # A new radio is unknown to NetworkManager and avahi; without these it would be managed away or
+    # announce the guest network, exactly as ap-slot-new.sh prevents for a freshly created slot.
+    _claim_interface(d['if'])
+    _run([SYSCTL, 'start', f"ap-wlan@{s['SLOT']}"], 30)
+    rc, fo, fe = _run([FIREWALL], 60)
+    if rc != 0: raise ApError('firewall refused the new radio: ' + (fe or fo).strip()[-300:])
     _run([SYSCTL, 'start', s['DNSMASQ_UNIT']], 30)
     _pin_write(s); _restart_hostapd(s); time.sleep(2)
     return {'slot': s['SLOT'], 'radio': _radio(_slot(s['SLOT'])), 'hostapd': _active(s['HOSTAPD_UNIT']),
             'pin': _pin_info(_slot(s['SLOT']))}
 
 
-def slot_sync(slot=None):
-    """Follow the pinned radio to whatever name it has now (ap-ifsync), then re-apply the firewall."""
+def _slot_sync_impl(slot=None):
+    """Follow the pinned radio to whatever name it has now (ap-ifsync), then make the running services
+    match: rewriting the config files alone would leave hostapd and dnsmasq bound to the old interface."""
     s = _slot(slot)
-    rc, out, err = _run([IFSYNC, 'sync', s['SLOT']], 20)
+    rc, out, err = _run([IFSYNC, 'sync', s['SLOT']], 40)
     if rc != 0: raise ApError((err or out).strip()[-300:])
-    _run([FIREWALL], 60)
-    return {'slot': s['SLOT'], 'msg': out.strip(), 'radio': _radio(_slot(s['SLOT']))}
+    moved = '->' in out
+    s = _slot(s['SLOT'])
+    if moved:
+        _run([SYSCTL, 'stop', s['HOSTAPD_UNIT']], 60)
+        _run([SYSCTL, 'restart', f"ap-wlan@{s['SLOT']}"], 30)
+    rc, fo, fe = _run([FIREWALL], 60)
+    if rc != 0: raise ApError('firewall refused the new interface: ' + (fe or fo).strip()[-300:])
+    if moved:
+        _run([SYSCTL, 'restart', s['DNSMASQ_UNIT']], 30)
+        _restart_hostapd(s); time.sleep(2)
+    return {'slot': s['SLOT'], 'msg': out.strip(), 'moved': moved, 'radio': _radio(_slot(s['SLOT'])),
+            'hostapd': _active(s['HOSTAPD_UNIT']), 'pin': _pin_info(_slot(s['SLOT']))}
 
 
 def _slot_enable_impl(slot, enabled):
     s = _slot(slot); env_path = os.path.join(SLOTS_DIR, s['SLOT'] + '.env')
-    units = [s['HOSTAPD_UNIT'], s['DNSMASQ_UNIT'], f"wg-quick@{s['WG_IF']}"]
+    # A direct slot has no tunnel: starting or enabling one would contradict its pin and the watchdog
+    # would stop the SSID a minute later.
+    units = [s['HOSTAPD_UNIT'], s['DNSMASQ_UNIT']]
+    if s.get('MODE', 'vpn') == 'vpn': units.append(f"wg-quick@{s['WG_IF']}")
     if enabled:
         _set_env_key(env_path, 'ENABLED', '1'); _run([SYSCTL, 'start', f"ap-wlan@{s['SLOT']}"], 20)
         _run([FIREWALL], 60); _run([SYSCTL, 'start', *units], 60); _run([SYSCTL, 'enable', *units], 20)
@@ -637,9 +711,12 @@ def _verify_impl(slot=None):
 
 
 def firewall_reapply():
-    rc, out, err = _run([FIREWALL], 60)
-    if rc != 0: raise ApError('firewall: ' + (err or out).strip()[-300:])
-    return {'ok': True, 'msg': out.strip()}
+    # Takes the same lock as the other long operations: two ap-firewall runs at once would flush the
+    # chains under each other and one of them would finish against a half-built rule set.
+    with long_op('firewall'):
+        rc, out, err = _run([FIREWALL], 60)
+        if rc != 0: raise ApError('firewall: ' + (err or out).strip()[-300:])
+        return {'ok': True, 'msg': out.strip()}
 
 
 def system_logs(lines=60, unit=None):
@@ -729,6 +806,11 @@ def slot_mode(slot, mode, confirm=None):
 def slot_bind(slot, target, confirm=None):
     with long_op('slot.bind'):
         return _slot_bind_impl(slot, target, confirm)
+
+
+def slot_sync(slot=None):
+    with long_op('slot.sync'):
+        return _slot_sync_impl(slot)
 
 
 def slot_enable(slot, enabled):

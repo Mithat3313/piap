@@ -46,13 +46,17 @@ while [ \$# -gt 0 ]; do case "\$1" in
   -t) t=\$2; shift 2;;
   -C) mode=check; a+=("\$2"); shift 2;;
   -A|-I) mode=add; a+=("\$2"); shift 2; [ "\${1:-}" = 1 ] && shift;;
-  -N) echo "chain \$t \$2" >> "\$S"; exit 0;;
+  -N) grep -qxF "chain \$t \$2" "\$S" 2>/dev/null && exit 1     # real iptables refuses an existing chain
+      echo "chain \$t \$2" >> "\$S"; exit 0;;
   -F) grep -v "^\$t \$2 " "\$S" 2>/dev/null > "\$S.t" || true; mv -f "\$S.t" "\$S" 2>/dev/null; exit 0;;
   -S) grep "^\$t \$2 " "\$S" 2>/dev/null | cut -d' ' -f3-; exit 0;;
   *) a+=("\$1"); shift;;
 esac; done
 line="\$t \${a[*]}"
-if [ "\$mode" = check ]; then grep -qxF "\$line" "\$S" 2>/dev/null; exit \$?; fi
+if [ "\$mode" = check ]; then
+  [ -n "\${FAIL_CHECK:-}" ] && case "\$line" in *"\$FAIL_CHECK"*) exit 1;; esac
+  grep -qxF "\$line" "\$S" 2>/dev/null; exit \$?
+fi
 echo "\$line" >> "\$S"; exit 0
 EOF
   cp "$R/bin/iptables" "$R/bin/ip6tables"; sed -i.bak "s|state/ipt|state/ip6t|" "$R/bin/ip6tables"; rm -f "$R/bin/ip6tables.bak"
@@ -73,6 +77,9 @@ case "\$1 \$2" in
   "rule del") shift 2; p=\$2; grep -q "^\$p:" "\$RULES" 2>/dev/null || exit 1
               grep -v "^\$p:" "\$RULES" > "\$RULES.t"; mv "\$RULES.t" "\$RULES"; exit 0;;
   "route replace") shift 2; tbl=\$(echo "\$*" | sed -nE 's/.*table ([0-9]+).*/\1/p'); echo "\$tbl \$(echo "\$*" | sed -E 's/ table [0-9]+//')" >> "\$ROUTES"; exit 0;;
+  "route del") shift 2; tbl=\$(echo "\$*" | sed -nE 's/.*table ([0-9]+).*/\1/p'); what=\$(echo "\$*" | sed -E 's/ table [0-9]+//')
+              grep -q "^\$tbl \$what" "\$ROUTES" 2>/dev/null || exit 1
+              grep -v "^\$tbl \$what" "\$ROUTES" > "\$ROUTES.t"; mv "\$ROUTES.t" "\$ROUTES"; exit 0;;
   "route show") tbl=\$(echo "\$*" | sed -nE 's/.*table ([0-9]+).*/\1/p'); grep "^\$tbl " "\$ROUTES" 2>/dev/null | cut -d' ' -f2-; exit 0;;
 esac
 exit 0
@@ -85,7 +92,8 @@ EOF
 
 run_fw(){ ( cd "$R" && PATH="$R/bin:$PATH" AP_ENV="$R/ap.env" SLOTS_DIR="$R/slots" WG_DIR="$R/wg" \
     SYSFS_NET="$R/sys" IPT="$R/bin/iptables" IP6T="$R/bin/ip6tables" IP="$R/bin/ip" SYSCTL="$R/bin/sysctl" \
-    bash "$FW" ) > "$R/out" 2> "$R/err"; echo $?; }
+    FAIL_CHECK="${FAIL_CHECK:-}" bash "$FW" ) > "$R/out" 2> "$R/err"; echo $?; }
+setmode(){ sed "s|^MODE=.*|MODE=$2|" "$R/slots/$1.env" > "$R/slots/$1.env.t"; mv "$R/slots/$1.env.t" "$R/slots/$1.env"; }
 
 slot(){ # slot if net idx mode [profile]
   cat > "$R/slots/$1.env" <<EOF
@@ -176,6 +184,45 @@ echo "== scenario 4: MODE must be vpn or direct =="
 setup /tmp/piap-fw-4; slot ap0 wlan0 10.99.0 0 bogus
 rc=$(run_fw)
 [ "$rc" != 0 ] && grep -q "MODE must be vpn or direct" "$R/err" && ok "an unknown MODE is refused (fail closed)" || no "an unknown MODE was accepted"
+
+# =============================================================== 5. direct -> vpn leaves no LAN default behind
+echo
+echo "== scenario 5: a slot switched from direct to vpn keeps no way out =="
+setup /tmp/piap-fw-5
+slot ap0 wlan0 10.99.0 0 direct
+rc=$(run_fw); RO=$R/state/routes
+[ "$rc" = 0 ] && ok "direct run applied" || no "direct run exited $rc: $(cat "$R/err")"
+has "51820 default via 192.168.1.1 dev eth0" "$RO" "direct: LAN default is in the table"
+setmode ap0 vpn                                    # the user switches the slot to vpn (no profile yet)
+rc=$(run_fw); I=$R/state/ipt; RO=$R/state/routes
+[ "$rc" = 0 ] && ok "vpn run applied (the stale LAN default did not break it)" || no "vpn run exited $rc: $(cat "$R/err")"
+grep -q "^51820 default via" "$RO" && no "the LAN default survived the switch - a way out without the tunnel" || ok "the LAN default was removed"
+hasnt "filter AP-VPN-FWD -i wlan0 -o eth0 -j ACCEPT" "$I" "no LAN exit rule after the switch"
+has "filter AP-VPN-FWD -i wlan0 -j DROP" "$I" "kill switch present after the switch"
+rc=$(run_fw); [ "$rc" = 0 ] && ok "a third run still succeeds (not stuck refusing forever)" || no "run exited $rc: $(cat "$R/err")"
+
+# =============================================================== 6. two slots may not claim one radio
+echo
+echo "== scenario 6: two enabled slots claiming the same interface =="
+setup /tmp/piap-fw-6; touch "$R/wg0_up"
+slot ap0 wlan1 10.99.0 0 direct
+slot ap1 wlan1 10.98.0 1 vpn hetzner        # same AP_IF: a stale name after a re-plug
+rc=$(run_fw); I=$R/state/ipt
+[ "$rc" != 0 ] && ok "refused before writing anything: $(head -1 "$R/err")" || no "accepted two slots on one interface"
+grep -q "AP-VPN-FWD -i wlan1 -o eth0 -j ACCEPT" "$I" 2>/dev/null \
+  && no "a LAN exit was written for the shared interface (the vpn slot's clients could use it)" \
+  || ok "no LAN exit rule was written at all"
+
+# =============================================================== 7. a failing self-check tears forwarding down
+echo
+echo "== scenario 7: the self-check fails after the rules are already in the kernel =="
+setup /tmp/piap-fw-7; touch "$R/wg0_up"
+slot ap0 wlan0 10.99.0 0 vpn hetzner
+rc=$(FAIL_CHECK="AP-VPN-FWD -i wlan0 -o wg0 -j ACCEPT" run_fw); I=$R/state/ipt
+[ "$rc" != 0 ] && ok "exits non-zero, so ap-hostapd@ cannot start" || no "self-check failure was not reported"
+grep -q "AP-VPN-FWD -i wlan0 -o wg0 -j ACCEPT" "$I" && no "the rejected rule set is still live" || ok "the rejected rule set was torn down"
+has "filter AP-VPN-FWD -i wlan0 -j DROP" "$I" "every AP interface is dropped instead (fail closed)"
+grep -q "nat AP-VPN-POST .*MASQUERADE" "$I" && no "NAT survived the teardown" || ok "NAT was removed with it"
 
 echo
 printf -- '---- %d PASS, %d FAIL ----\n' "$pass" "$fail"
