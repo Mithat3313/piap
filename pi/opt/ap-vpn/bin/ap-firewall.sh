@@ -60,13 +60,15 @@ load_slot(){
   : "${ENABLED:=1}"
   : "${MODE:=vpn}"
   case "$MODE" in vpn|direct) :;; *) die "$SLOT: MODE must be vpn or direct (found '$MODE')";; esac
+  # Resolve the radio FIRST, then validate: the checks have to run against the interface the rules will
+  # actually be written for, not against the possibly stale name in the env.
+  if [ -n "${AP_MAC:-}" ]; then
+    _live=$(resolve_ap_if "$AP_MAC") && AP_IF=$_live
+  fi
   [ "$AP_IF" != "$LAN_IF" ] || die "$SLOT: AP_IF is the same as LAN_IF"
   [ "$AP_IF" != "$DEF_IF" ]  || die "$SLOT: the default route is on $AP_IF - this would cut SSH"
   LAN_PFX=$($IP -4 -o addr show dev "$LAN_IF" 2>/dev/null | awk '{print $4}' | cut -d. -f1-3 | head -1)
   [ -z "$LAN_PFX" ] || case "$AP_NET" in "$LAN_PFX".*) die "$SLOT: AP_NET collides with the LAN network";; esac
-  if [ -n "${AP_MAC:-}" ]; then
-    _live=$(resolve_ap_if "$AP_MAC") && AP_IF=$_live
-  fi
   DEV_PRESENT=0; [ -d "$SYSFS_NET/$AP_IF" ] && DEV_PRESENT=1
   WGCONF=$WG_DIR/${WG_IF}.conf
   if [ -r "$WGCONF" ]; then

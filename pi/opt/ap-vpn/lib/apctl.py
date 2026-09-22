@@ -475,7 +475,11 @@ def _vpn_activate_impl(name, slot=None, force=False, confirm=None, _internal=Fal
     rc, out, err = _run_detached([SWAP, p, '--apply', f"--slot={s['SLOT']}"], 200)
     ok = rc == 0
     if ok:
-        _set_env_key(os.path.join(SLOTS_DIR, s['SLOT'] + '.env'), 'PROFILE', name); _pin_write(s)
+        _set_env_key(os.path.join(SLOTS_DIR, s['SLOT'] + '.env'), 'PROFILE', name)
+        # Enable the unit too, or the tunnel would not come back after a reboot - the slot would be up
+        # and fail-closed, with no obvious reason why nothing works.
+        _run([SYSCTL, 'enable', f"wg-quick@{s['WG_IF']}"], 20)
+        _pin_write(s)
     elif was_detached:
         # On a detached slot the 'previous' conf restored by the swap script may now belong to ANOTHER slot
         # (a half-finished swap): stop the tunnel so the same key never runs twice; the slot stays without a

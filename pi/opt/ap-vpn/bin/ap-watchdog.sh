@@ -21,7 +21,17 @@ mkdir -p "$STATE"
 LASTR="$STATE/last_restart"
 [ -f "$LASTR" ] || echo 0 > "$LASTR"
 
-# --- 0. direct slots have no tunnel: only the routing needs watching ---
+# --- 0a. Did the last ap-firewall run finish? Its guard rule (priority 999) is only lifted after the
+# self-check passes, so finding one means the rules were torn down and left fail-closed. Retry here,
+# once a minute, so a transient cause (a radio that was still appearing, a tunnel mid-restart) heals
+# itself instead of needing a human.
+if $IP rule show | grep -q "^999:"; then
+  logger -t ap-watchdog -p daemon.warning "$SLOT: the last firewall run did not finish (guard rule present) - retrying"
+  /opt/ap-vpn/bin/ap-firewall.sh >/dev/null 2>&1 \
+    || logger -t ap-watchdog -p daemon.err "$SLOT: ap-firewall still refuses to apply - APs stay down (fail closed)"
+fi
+
+# --- 0b. direct slots have no tunnel: only the routing needs watching ---
 if [ "$MODE" = direct ]; then
   LAN_GW=$($IP -o -4 route show default | awk '{print $3; exit}')
   $IP route show table "$TABLE" | grep -q "^default via ${LAN_GW:-x} dev ${LAN_IF}" \

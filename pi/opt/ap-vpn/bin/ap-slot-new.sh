@@ -129,6 +129,11 @@ systemctl enable --now "ap-wlan@$SLOT.service" >/dev/null 2>&1; echo "   ap-wlan
 systemctl enable --now "ap-dnsmasq@$SLOT.service" >/dev/null 2>&1; sleep 1; echo "   ap-dnsmasq@$SLOT: $(systemctl is-active ap-dnsmasq@$SLOT)"
 systemctl enable --now "ap-hostapd@$SLOT.service" >/dev/null 2>&1; sleep 3; echo "   ap-hostapd@$SLOT: $(systemctl is-active ap-hostapd@$SLOT)"
 /usr/sbin/iw dev "$AP_IF" info 2>/dev/null | grep -E 'ssid|channel' | sed 's/^\s*/   /'
+# Pin it right away: creating the slot IS the deliberate act, and until the pin exists the guarantee
+# "this SSID cannot change its radio or its exit behind your back" does not hold yet.
+/opt/ap-vpn/bin/ap-ctl --slot "$SLOT" slot pin --confirm "$SSID" >/dev/null 2>&1 \
+  && echo "   pinned: SSID, mode ($MODE) and radio ($AP_MAC)" \
+  || echo "   NOTE: could not pin automatically - run: ap-ctl --slot $SLOT slot pin --confirm '$SSID'"
 echo
 echo "SSID:     $SSID"
 echo "PASSWORD: $PSK"
