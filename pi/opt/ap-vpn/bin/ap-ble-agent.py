@@ -127,7 +127,7 @@ class Sessions:
 SESS = Sessions()
 STALE_LINK_S = 45          # a central that connects but does not authenticate within this many seconds is disconnected
 LONG_LOCK = threading.Lock()
-LONG_OPS = {'vpn.activate', 'vpn.swap', 'vpn.add', 'verify', 'wifi.set', 'exitip', 'firewall', 'agent.update', 'slot.enable', 'slot.disable', 'slot.pin'}
+LONG_OPS = {'vpn.activate', 'vpn.swap', 'vpn.add', 'verify', 'wifi.set', 'exitip', 'firewall', 'agent.update', 'slot.enable', 'slot.disable', 'slot.pin', 'slot.mode', 'slot.bind', 'slot.sync'}
 
 
 # ============================================================ commands
@@ -147,6 +147,10 @@ def dispatch(msg):
     if op == 'slot.enable':   return apctl.slot_enable(slot, True)
     if op == 'slot.disable':  return apctl.slot_enable(slot, False)
     if op == 'slot.pin':      return apctl.slot_pin(slot, a.get('confirm'))
+    if op == 'slot.mode':     return apctl.slot_mode(slot, a.get('mode'), a.get('confirm'))
+    if op == 'slot.bind':     return apctl.slot_bind(slot, a.get('target'), a.get('confirm'))
+    if op == 'slot.sync':     return apctl.slot_sync(slot)
+    if op == 'devices':       return apctl.devices()
     if op == 'exitip':        return apctl.exit_ip(slot)
     if op == 'verify':        return apctl.verify(slot)
     if op == 'firewall':      return apctl.firewall_reapply()

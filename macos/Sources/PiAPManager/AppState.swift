@@ -29,13 +29,22 @@ enum Keychain {
 // MARK: - Modeller
 struct APInfo { var iface = "", ssid = "?", up = false, channel = 0, width = 0, band = "" }
 struct VPNInfo { var iface = "", profile: String? = nil, up = false, healthy = false, endpoint = "-", handshakeAge: Int? = nil, address = "-", rx = 0, tx = 0, mtu = 0 }
+/// The physical radio a slot is bound to. The MAC is the identity; the interface name can change.
+struct RadioInfo { var iface = "", mac: String? = nil, driver: String? = nil, present = true }
 /// Assignment pin: SSID ↔ profile ↔ server key ↔ radio MAC. On the Pi, ap-pin.sh stops the SSID on drift (fail-closed).
 struct PinInfo { var pinned = false, profile: String? = nil, ssid: String? = nil, peer: String? = nil, mac: String? = nil, ok = true, msg = "", violation: String? = nil }
 struct Slot: Identifiable {
-    let name: String; var enabled: Bool; var ap: APInfo; var vpn: VPNInfo; var net: String; var clients: Int; var killswitch: Bool; var services: [String: Bool]; var pin: PinInfo
+    let name: String; var enabled: Bool; var mode: String; var ap: APInfo; var vpn: VPNInfo; var radio: RadioInfo
+    var net: String; var clients: Int; var killswitch: Bool; var services: [String: Bool]; var pin: PinInfo
+    var isDirect: Bool { mode == "direct" }
     var id: String { name }
     init(_ d: [String: Any]) {
         name = d["name"] as? String ?? "?"; enabled = d["enabled"] as? Bool ?? true; net = d["net"] as? String ?? ""
+        mode = d["mode"] as? String ?? "vpn"
+        var r = RadioInfo(); if let x = d["radio"] as? [String: Any] {
+            r.iface = x["if"] as? String ?? ""; r.mac = x["mac"] as? String; r.driver = x["driver"] as? String
+            r.present = x["present"] as? Bool ?? true }
+        radio = r
         clients = d["clients"] as? Int ?? 0; killswitch = (d["killswitch"] as? [String: Any])?["ok"] as? Bool ?? false
         services = d["services"] as? [String: Bool] ?? [:]
         var pi = PinInfo(); if let x = d["pin"] as? [String: Any] {
@@ -214,6 +223,22 @@ final class AppState: ObservableObject {
             let r = try await self.ble.callDict("vpn.swap", args: ["slot_a": a, "slot_b": b, "confirm": confirm], timeout: 400)
             self.verifyResult = (r["summary"] as? [String])?.joined(separator: "\n")
             await self.refreshProfiles(); await self.refreshStatus(); self.exitIP = [:]
+        }
+    }
+    /// Switch a slot between 'vpn' (exit only through its tunnel) and 'direct' (no VPN, exit through the LAN).
+    /// Needs the SSID typed back: this is the one change that could let someone out without the tunnel.
+    func setMode(_ slot: String, _ mode: String, confirm: String) {
+        run("\(slot) → \(mode)") {
+            let r = try await self.ble.callDict("slot.mode", args: ["slot": slot, "mode": mode, "confirm": confirm], timeout: 180)
+            self.verifyResult = "\(slot): \(r["mode"] as? String ?? mode)"
+            await self.refreshProfiles(); await self.refreshStatus()
+        }
+    }
+    /// Follow the pinned radio to whatever interface name it has now.
+    func syncRadio(_ slot: String) {
+        run("\(slot) radio") {
+            let r = try await self.ble.callDict("slot.sync", args: ["slot": slot], timeout: 90)
+            self.verifyResult = r["msg"] as? String; await self.refreshStatus()
         }
     }
     /// Pin the slot's CURRENT state (after a violation, once the state has been verified) and start the SSID.

@@ -17,6 +17,10 @@
 | `vpn activate <name> --confirm '<SSID>'` | Assign the profile to `--slot`. If the profile is on another slot: `--force` and `--confirm '<target SSID> / <other SSID>'` |
 | `vpn swap apA apB --confirm '<SSID A> / <SSID B>'` | Exchange the profiles of two slots |
 | `slot enable` / `slot disable` | Turn an SSID on/off (SSID, DHCP and tunnel together) |
+| `slot mode vpn\|direct --confirm '<SSID>'` | Choose the exit: only through this slot's tunnel, or through the LAN with no VPN at all |
+| `slot bind <iface\|MAC> --confirm '<SSID>'` | Move this slot to another physical radio (the default is that a new adapter gets its own slot) |
+| `slot sync` | Follow the pinned radio to whatever interface name it has now |
+| `devices` | Every radio: interface, MAC, driver, AP capability, owning slot |
 | `slot pin --confirm '<SSID>'` | Pin the current state (after a violation, once the state is verified) |
 | `exitip` | Exit IP as seen through the tunnel |
 | `verify` | `ap-verify.sh --slot` |
@@ -68,6 +72,27 @@ The SSIDs screen offers the same functions as the web panel; mapping changes ope
 
 Only one central can be connected: while the app is connected, a second device cannot attach. The app closes the connection cleanly on quit.
 
+## Running an SSID without a VPN
+
+A slot's exit is either its own tunnel (`vpn`, the default) or the LAN (`direct`). In `direct` mode the SSID works immediately with no VPN; clients reach the internet through the LAN, but still cannot reach the LAN's own hosts, the other SSIDs, or anything on the Pi beyond DHCP and DNS.
+
+```bash
+sudo ap-slot-new.sh ap2 wlan2 2.4 --mode direct        # a plain guest network from the start
+sudo ap-ctl --slot ap1 slot mode direct --confirm 'my_ssid'   # or switch an existing one
+```
+
+Switching to `direct` detaches the profile and stops that slot's tunnel; switching back to `vpn` leaves the SSID without internet until you assign a profile — deliberately, so an SSID that was exposed stops working rather than continuing unprotected. Both directions need the SSID typed back, and the mode is stored in the pin, so a `vpn` slot can never end up on the LAN by accident.
+
+## Changing the Wi‑Fi adapter
+
+Each slot is bound to a radio's MAC, not to `wlan0`/`wlan1`:
+
+- **The same adapter in another port** (or a different enumeration order): nothing to do. `ap-ifsync` finds it by MAC before the slot starts and updates the config; `ap-ctl --slot apN slot sync` does it on demand.
+- **A different adapter**: it does not take over the old slot. Give it its own, which gives it its own subnet, SSID and exit: `sudo ap-slot-new.sh ap2 <iface|MAC> 2.4`. `ap-ctl devices` lists what is plugged in and which slot owns it.
+- **Really moving a slot to another radio**: `sudo ap-ctl --slot ap1 slot bind <MAC> --confirm '<SSID>'`.
+
+While the pinned radio is missing, that SSID stays down — it never comes up on a different device.
+
 ## Changing profiles and swapping
 
 An SSID's VPN can be changed in three ways:
@@ -86,4 +111,4 @@ The **On/Off** switch in the panel or `ap-ctl --slot apN slot disable`: the SSID
 
 The card shows "ASSIGNMENT VIOLATION — SSID stopped" in red and the message says what does not match (e.g. `PROFILE='x' pinned='y'`, `wg0.conf server key differs from pin`, `RADIO DIFFERS`). If you did not make this change, investigate first: `journalctl -t ap-pin`, the slot env file, `/etc/wireguard/wgN.conf`. If the state is genuinely correct, **Re-pin** (typing the SSID) updates the pin and starts the SSID. An inconsistent state cannot be pinned; make it consistent first.
 
-If you replaced the USB adapter, a `RADIO DIFFERS` violation is the expected behaviour; re-pinning accepts the new MAC.
+If you replaced the USB adapter, a `RADIO DIFFERS` violation is the expected behaviour: that SSID does not come up on a different device. Give the new adapter its own slot, or bind this one to it explicitly (see "Changing the Wi‑Fi adapter").

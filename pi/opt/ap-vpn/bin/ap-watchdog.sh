@@ -13,12 +13,27 @@ set -u
 # AP_WATCHDOG_SLOT_LOOP: without --slot, call ourselves once per enabled slot
 if ! printf "%s\n" "$@" | grep -q "^--slot="; then /opt/ap-vpn/bin/ap-pin.sh enforce >/dev/null 2>&1; rc=0; for f in /etc/ap-vpn/slots/*.env; do grep -q "^ENABLED=1" "$f" && { "$0" --slot=$(basename "$f" .env) || rc=1; }; done; exit $rc; fi
 SLOT=ap0; for _a in "$@"; do case "$_a" in --slot=*) SLOT="${_a#--slot=}";; esac; done; [ -r "/etc/ap-vpn/slots/$SLOT.env" ] && . "/etc/ap-vpn/slots/$SLOT.env"; export SLOT
+MODE=${MODE:-vpn}
 IP=/usr/sbin/ip
 WG=/usr/bin/wg
 STATE=/run/ap-vpn/$SLOT
 mkdir -p "$STATE"
 LASTR="$STATE/last_restart"
 [ -f "$LASTR" ] || echo 0 > "$LASTR"
+
+# --- 0. direct slots have no tunnel: only the routing needs watching ---
+if [ "$MODE" = direct ]; then
+  LAN_GW=$($IP -o -4 route show default | awk '{print $3; exit}')
+  $IP route show table "$TABLE" | grep -q "^default via" \
+    || { logger -t ap-watchdog -p daemon.warning "$SLOT (direct): no LAN default route in table $TABLE - re-applying the firewall"; /opt/ap-vpn/bin/ap-firewall.sh >/dev/null 2>&1; }
+  $IP route show table "$TABLE" | grep -q "^${AP_NET} dev ${AP_IF}" \
+    || { logger -t ap-watchdog -p daemon.warning "$SLOT (direct): AP link route missing - re-applying the firewall"; /opt/ap-vpn/bin/ap-firewall.sh >/dev/null 2>&1; }
+  $IP rule show | grep -q "from ${AP_NET} blackhole" \
+    || { logger -t ap-watchdog -p daemon.err "$SLOT (direct): blackhole rule missing - re-applying the firewall"; /opt/ap-vpn/bin/ap-firewall.sh >/dev/null 2>&1; }
+  # A direct slot must never have a tunnel running: that would contradict its pin.
+  [ -d "/sys/class/net/$WG_IF" ] && { logger -t ap-watchdog -p daemon.err "$SLOT (direct): $WG_IF is up - stopping it"; systemctl stop "wg-quick@$WG_IF"; }
+  exit 0
+fi
 
 # --- 1. Is the tunnel interface missing entirely? ---
 if [ ! -d "/sys/class/net/$WG_IF" ]; then

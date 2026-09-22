@@ -15,6 +15,7 @@ SWAP      = '/opt/ap-vpn/bin/ap-swap-peer.sh'
 VERIFY    = '/opt/ap-vpn/bin/ap-verify.sh'
 FIREWALL  = '/opt/ap-vpn/bin/ap-firewall.sh'
 PIN       = '/opt/ap-vpn/bin/ap-pin.sh'
+IFSYNC    = '/opt/ap-vpn/bin/ap-ifsync.sh'
 IW, WG, IP, SYSCTL = '/usr/sbin/iw', '/usr/bin/wg', '/usr/sbin/ip', '/usr/bin/systemctl'
 SYSTEMD_RUN = '/usr/bin/systemd-run'
 _NAME = re.compile(r'\A[A-Za-z0-9][A-Za-z0-9_-]{0,31}\Z')
@@ -157,8 +158,25 @@ def _ap_info(slot):
             'isolate': h.get('ap_isolate') == '1'}
 
 
+def _radio(slot):
+    """The physical radio behind a slot. The MAC is the identity; the name can change."""
+    ap_if = slot['AP_IF']; mac = slot.get('AP_MAC') or None
+    try: live = open(f'/sys/class/net/{ap_if}/address').read().strip()
+    except OSError: live = None
+    drv = None
+    try: drv = os.path.basename(os.path.realpath(f'/sys/class/net/{ap_if}/device/driver'))
+    except OSError: pass
+    return {'if': ap_if, 'mac': mac, 'live_mac': live, 'driver': drv,
+            'present': live is not None and (mac is None or live == mac)}
+
+
 def _vpn_info(slot):
-    wg_if = slot['WG_IF']; v = {'if': wg_if, 'up': False, 'profile': slot.get('PROFILE') or None}
+    mode = slot.get('MODE', 'vpn')
+    wg_if = slot['WG_IF']; v = {'if': wg_if, 'mode': mode, 'up': False, 'profile': slot.get('PROFILE') or None}
+    if mode == 'direct':
+        # No tunnel by design: report the LAN as the exit so every surface can show it plainly.
+        v.update({'healthy': True, 'exit': 'lan', 'endpoint': _env().get('LAN_IF', 'eth0')})
+        return v
     rc, out, _ = _run([WG, 'show', wg_if, 'dump'], 5)
     if rc == 0 and out.strip():
         lines = out.strip().split('\n')
@@ -171,13 +189,15 @@ def _vpn_info(slot):
             try: v['mtu'] = int(open(f'/sys/class/net/{wg_if}/mtu').read())
             except Exception: v['mtu'] = None
     v['healthy'] = bool(v.get('handshake_age_s') is not None and v['handshake_age_s'] <= 300)
+    v['exit'] = 'tunnel'
     return v
 
 
 def _killswitch(slot):
-    ipt = '/usr/sbin/iptables'; ap_if, wg_if, ap_net = slot['AP_IF'], slot['WG_IF'], slot['AP_NET']
+    ipt = '/usr/sbin/iptables'; ap_if, ap_net = slot['AP_IF'], slot['AP_NET']
+    exit_if = _env().get('LAN_IF', 'eth0') if slot.get('MODE', 'vpn') == 'direct' else slot['WG_IF']
     ok_drop = _run([ipt, '-C', 'AP-VPN-FWD', '-i', ap_if, '-j', 'DROP'], 5)[0] == 0
-    ok_fwd = _run([ipt, '-C', 'AP-VPN-FWD', '-i', ap_if, '-o', wg_if, '-j', 'ACCEPT'], 5)[0] == 0
+    ok_fwd = _run([ipt, '-C', 'AP-VPN-FWD', '-i', ap_if, '-o', exit_if, '-j', 'ACCEPT'], 5)[0] == 0
     ok_hook = _run([ipt, '-C', 'DOCKER-USER', '-j', 'AP-VPN-FWD'], 5)[0] == 0
     ok_bh = f'from {ap_net} blackhole' in _run([IP, 'rule', 'show'], 5)[1]
     return {'filter': ok_drop and ok_fwd and ok_hook, 'blackhole': ok_bh, 'ok': ok_drop and ok_fwd and ok_hook and ok_bh}
@@ -185,7 +205,8 @@ def _killswitch(slot):
 
 def slot_status(name=None):
     s = _slot(name)
-    return {'name': s['SLOT'], 'enabled': s.get('ENABLED', '1') == '1', 'ap': _ap_info(s), 'vpn': _vpn_info(s),
+    return {'name': s['SLOT'], 'enabled': s.get('ENABLED', '1') == '1', 'mode': s.get('MODE', 'vpn'),
+            'ap': _ap_info(s), 'vpn': _vpn_info(s), 'radio': _radio(s),
             'net': s['AP_NET'], 'clients': len(clients(s['SLOT'])), 'killswitch': _killswitch(s), 'pin': _pin_info(s),
             'services': {u: _active(u) for u in (s['HOSTAPD_UNIT'], s['DNSMASQ_UNIT'], f"wg-quick@{s['WG_IF']}", f"ap-wlan@{s['SLOT']}")}}
 
@@ -364,12 +385,14 @@ def _ssid_of(s): return _read_kv(_hostapd_path(s)).get('ssid') or ''
 
 
 def _pin_info(s):
-    rc, out, _ = _run([PIN, 'check', s['SLOT']], 10)
+    rc, out, _ = _run([PIN, 'check', s['SLOT']], 15)
     viol = None
     try: viol = open(f"/run/ap-vpn/{s['SLOT']}/pin-violation").read().strip() or None
     except FileNotFoundError: pass
     hx = s.get('PIN_SSID_HEX') or ''
-    return {'pinned': bool(s.get('PIN_PROFILE')), 'profile': s.get('PIN_PROFILE') or None,
+    mode = s.get('MODE', 'vpn')
+    return {'pinned': bool(s.get('PIN_PROFILE')) or (mode == 'direct' and bool(s.get('PIN_MODE'))),
+            'mode': s.get('PIN_MODE') or None, 'profile': s.get('PIN_PROFILE') or None,
             'ssid': bytes.fromhex(hx).decode('utf-8', 'replace') if hx else None,
             'peer': (s.get('PIN_PEER') or '')[:12] or None, 'mac': s.get('AP_MAC') or None,
             'ok': rc == 0, 'msg': out.strip(), 'violation': viol}
@@ -384,7 +407,8 @@ def _pin_write(s):
         if not peer: raise ApError(f'profile {prof}: no PublicKey, cannot be pinned')
     try: mac = open(f"/sys/class/net/{s['AP_IF']}/address").read().strip()
     except FileNotFoundError: mac = s.get('AP_MAC') or ''
-    for k, v in (('PIN_SSID_HEX', _ssid_of(s).encode().hex()), ('PIN_PROFILE', prof), ('PIN_PEER', peer), ('AP_MAC', mac)):
+    for k, v in (('PIN_MODE', s.get('MODE', 'vpn')), ('PIN_SSID_HEX', _ssid_of(s).encode().hex()),
+                 ('PIN_PROFILE', prof), ('PIN_PEER', peer), ('AP_MAC', mac)):
         _set_env_key(env_path, k, v)
     try: os.unlink(f"/run/ap-vpn/{s['SLOT']}/pin-violation")
     except FileNotFoundError: pass
@@ -426,6 +450,9 @@ def _vpn_activate_impl(name, slot=None, force=False, confirm=None, _internal=Fal
     in 'confirm'; on success the pin (PIN_*) is updated. The caller holds the long_op lock, so ap-pin
     enforce skips its audit meanwhile."""
     s = _slot(slot)
+    if s.get('MODE', 'vpn') != 'vpn':
+        raise ApError(f"{s['SLOT']} is in direct mode (no VPN). Switch it first: "
+                      f"ap-ctl --slot {s['SLOT']} slot mode vpn --confirm '{_ssid_of(s)}'")
     if not _NAME.match(name or ''): raise ApError('invalid name')
     p = os.path.join(PROFILES, name + '.conf')
     if not os.path.exists(p): raise ApError('no such profile')
@@ -467,6 +494,101 @@ def _vpn_swap_impl(slot_a, slot_b, confirm=None):
     if pa:
         r = _vpn_activate_impl(pa, b['SLOT'], _internal=True); log += r['summary']; log.append(f"{b['SLOT']} -> {pa}")
     return {'swapped': True, a['SLOT']: pb, b['SLOT']: pa, 'summary': log}
+
+
+def devices():
+    """Every wireless radio on the Pi: interface, MAC (its identity), driver, AP capability, owning slot."""
+    rc, out, err = _run([IFSYNC, 'list'], 15)
+    if rc != 0: raise ApError('could not list the radios: ' + (err or out).strip()[-200:])
+    rows = []
+    for line in out.strip().split('\n')[1:]:
+        p = line.split()
+        if len(p) >= 5:
+            rows.append({'if': p[0], 'mac': p[1], 'driver': p[2], 'ap_capable': p[3] == 'yes',
+                         'slot': None if p[4] == '-' else p[4]})
+    return rows
+
+
+def _dnsmasq_upstream(s, wg_src=None):
+    """Point the slot's resolver at the right place: through the tunnel in vpn mode (server=IP@src),
+    straight out in direct mode. Without the @src binding a vpn slot could resolve outside the tunnel,
+    so the two must always follow the mode."""
+    path = s['DNSMASQ_CONF']
+    if not os.path.exists(path): return
+    src = open(path).read()
+    if s.get('MODE', 'vpn') == 'direct':
+        new = re.sub(r'^(server=[0-9.]+)@.*$', lambda m: m.group(1), src, flags=re.M)
+    else:
+        # 127.0.0.1 is the fail-closed placeholder: no tunnel address yet means no upstream query leaves.
+        tgt = wg_src or _iface_ip(s['WG_IF']) or '127.0.0.1'
+        tgt = tgt.split('/')[0]
+        new = re.sub(r'^(server=[0-9.]+)(@.*)?$', lambda m: m.group(1) + '@' + tgt, src, flags=re.M)
+    if new != src:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path)); os.write(fd, new.encode()); os.close(fd)
+        os.chmod(tmp, 0o644); os.replace(tmp, path)
+        _run([SYSCTL, 'restart', s['DNSMASQ_UNIT']], 30)
+
+
+def _slot_mode_impl(slot, mode, confirm=None):
+    """Switch a slot between 'vpn' (exit only through its tunnel) and 'direct' (no VPN at all).
+    This is exactly the change that could let someone out through the local network by accident, so it
+    needs the SSID typed back, it is written into the pin, and going direct detaches the profile and
+    stops the tunnel first - a slot is never both."""
+    if mode not in ('vpn', 'direct'): raise ApError("mode must be 'vpn' or 'direct'")
+    s = _slot(slot); _require_confirm(confirm, s)
+    env_path = os.path.join(SLOTS_DIR, s['SLOT'] + '.env')
+    if mode == s.get('MODE', 'vpn'):
+        return {'slot': s['SLOT'], 'mode': mode, 'unchanged': True, 'pin': _pin_info(_slot(s['SLOT']))}
+    if mode == 'direct':
+        if s.get('PROFILE'): _detach_profile(s)      # stops the tunnel and clears the pin
+        _set_env_key(env_path, 'MODE', 'direct')
+    else:
+        _set_env_key(env_path, 'MODE', 'vpn')        # no profile yet: fail closed until one is assigned
+    s = _slot(s['SLOT'])
+    _dnsmasq_upstream(s)
+    rc, out, err = _run([FIREWALL], 60)
+    if rc != 0: raise ApError('firewall refused the new mode: ' + (err or out).strip()[-300:])
+    _pin_write(s)
+    _restart_hostapd(s); time.sleep(2)
+    return {'slot': s['SLOT'], 'mode': mode, 'ssid': _ssid_of(s), 'hostapd': _active(s['HOSTAPD_UNIT']),
+            'pin': _pin_info(_slot(s['SLOT']))}
+
+
+def _slot_bind_impl(slot, target, confirm=None):
+    """Bind a slot to a different physical radio (by interface name or MAC). The default is that a new
+    adapter gets its OWN slot - this is the explicit exception, for when you really mean 'this slot now
+    lives on that device'. Refused when the device already belongs to another slot."""
+    s = _slot(slot); _require_confirm(confirm, s)
+    target = (target or '').strip().lower()
+    devs = devices()
+    d = next((x for x in devs if x['mac'] == target or x['if'] == target), None)
+    if not d: raise ApError(f'no such radio: {target} (see: ap-ctl devices)')
+    if d['slot'] and d['slot'] != s['SLOT']: raise ApError(f"that radio already belongs to slot {d['slot']}")
+    if not d['ap_capable']: raise ApError(f"{d['if']} does not support AP mode")
+    env_path = os.path.join(SLOTS_DIR, s['SLOT'] + '.env')
+    _run([SYSCTL, 'stop', s['HOSTAPD_UNIT'], s['DNSMASQ_UNIT']], 60)
+    _run([SYSCTL, 'stop', f"ap-wlan@{s['SLOT']}"], 30)
+    _set_env_key(env_path, 'AP_MAC', d['mac']); _set_env_key(env_path, 'AP_IF', d['if'])
+    for path, key in ((_hostapd_path(s), 'interface'), (s['DNSMASQ_CONF'], 'interface')):
+        if os.path.exists(path):
+            txt = re.sub(rf'^{key}=.*$', lambda m: f"{key}={d['if']}", open(path).read(), count=1, flags=re.M)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path)); os.write(fd, txt.encode()); os.close(fd)
+            os.chmod(tmp, 0o600 if 'hostapd' in path else 0o644); os.replace(tmp, path)
+    s = _slot(s['SLOT'])
+    _run([SYSCTL, 'start', f"ap-wlan@{s['SLOT']}"], 30); _run([FIREWALL], 60)
+    _run([SYSCTL, 'start', s['DNSMASQ_UNIT']], 30)
+    _pin_write(s); _restart_hostapd(s); time.sleep(2)
+    return {'slot': s['SLOT'], 'radio': _radio(_slot(s['SLOT'])), 'hostapd': _active(s['HOSTAPD_UNIT']),
+            'pin': _pin_info(_slot(s['SLOT']))}
+
+
+def slot_sync(slot=None):
+    """Follow the pinned radio to whatever name it has now (ap-ifsync), then re-apply the firewall."""
+    s = _slot(slot)
+    rc, out, err = _run([IFSYNC, 'sync', s['SLOT']], 20)
+    if rc != 0: raise ApError((err or out).strip()[-300:])
+    _run([FIREWALL], 60)
+    return {'slot': s['SLOT'], 'msg': out.strip(), 'radio': _radio(_slot(s['SLOT']))}
 
 
 def _slot_enable_impl(slot, enabled):
@@ -591,6 +713,16 @@ def slot_pin(slot, confirm=None):
         return _slot_pin_impl(slot, confirm)
 
 
+def slot_mode(slot, mode, confirm=None):
+    with long_op('slot.mode'):
+        return _slot_mode_impl(slot, mode, confirm)
+
+
+def slot_bind(slot, target, confirm=None):
+    with long_op('slot.bind'):
+        return _slot_bind_impl(slot, target, confirm)
+
+
 def slot_enable(slot, enabled):
     with long_op('slot.enable'):
         return _slot_enable_impl(slot, enabled)
@@ -637,7 +769,7 @@ def _cli(argv):
     ap = argparse.ArgumentParser(prog='ap-ctl', description='Raspberry Pi VPN-AP control (multi-slot)')
     ap.add_argument('--slot', help='slot name (ap0, ap1 ...)')
     sub = ap.add_subparsers(dest='cmd', required=True)
-    for c in ('status', 'clients', 'verify', 'exitip', 'slots'): sub.add_parser(c)
+    for c in ('status', 'clients', 'verify', 'exitip', 'slots', 'devices'): sub.add_parser(c)
     k = sub.add_parser('kick'); k.add_argument('mac')
     w = sub.add_parser('wifi'); ws = w.add_subparsers(dest='sub', required=True); ws.add_parser('get')
     wset = ws.add_parser('set'); wset.add_argument('--ssid'); wset.add_argument('--psk')
@@ -646,6 +778,9 @@ def _cli(argv):
     vr = vs.add_parser('remove'); vr.add_argument('name'); vx = vs.add_parser('activate'); vx.add_argument('name'); vx.add_argument('--force', action='store_true'); vx.add_argument('--confirm', help="the affected SSIDs, joined with ' / '")
     vsw = vs.add_parser('swap'); vsw.add_argument('slot_a'); vsw.add_argument('slot_b'); vsw.add_argument('--confirm', help="'SSID_A / SSID_B'")
     sl = sub.add_parser('slot'); sls = sl.add_subparsers(dest='sub', required=True); sls.add_parser('enable'); sls.add_parser('disable'); sls.add_parser('pin').add_argument('--confirm', help="the SSID of this slot")
+    smode = sls.add_parser('mode'); smode.add_argument('value', choices=('vpn', 'direct')); smode.add_argument('--confirm', help="the SSID of this slot")
+    sbind = sls.add_parser('bind'); sbind.add_argument('target', help='interface name or MAC of the radio'); sbind.add_argument('--confirm', help="the SSID of this slot")
+    sls.add_parser('sync')
     s = sub.add_parser('system'); ss = s.add_subparsers(dest='sub', required=True)
     slg = ss.add_parser('logs'); slg.add_argument('-n', type=int, default=60); slg.add_argument('-u'); ss.add_parser('reboot'); ss.add_parser('firewall')
     wb = sub.add_parser('web'); wbs = wb.add_subparsers(dest='sub', required=True); wp = wbs.add_parser('password'); wp.add_argument('value', nargs='?')
@@ -656,6 +791,7 @@ def _cli(argv):
     try:
         if a.cmd == 'status': r = status()
         elif a.cmd == 'slots': r = [slot_status(n) for n in slots()]
+        elif a.cmd == 'devices': r = devices()
         elif a.cmd == 'clients': r = clients(a.slot)
         elif a.cmd == 'verify': r = verify(a.slot)
         elif a.cmd == 'exitip': r = exit_ip(a.slot)
@@ -667,7 +803,12 @@ def _cli(argv):
             elif a.sub == 'remove': r = vpn_remove(a.name)
             elif a.sub == 'activate': r = vpn_activate(a.name, a.slot, a.force, a.confirm)
             elif a.sub == 'swap': r = vpn_swap(a.slot_a, a.slot_b, a.confirm)
-        elif a.cmd == 'slot': r = slot_pin(a.slot, a.confirm) if a.sub == 'pin' else slot_enable(a.slot, a.sub == 'enable')
+        elif a.cmd == 'slot':
+            if a.sub == 'pin': r = slot_pin(a.slot, a.confirm)
+            elif a.sub == 'mode': r = slot_mode(a.slot, a.value, a.confirm)
+            elif a.sub == 'bind': r = slot_bind(a.slot, a.target, a.confirm)
+            elif a.sub == 'sync': r = slot_sync(a.slot)
+            else: r = slot_enable(a.slot, a.sub == 'enable')
         elif a.cmd == 'system':
             if a.sub == 'logs': r = system_logs(a.n, a.u)
             elif a.sub == 'reboot': r = system_reboot()

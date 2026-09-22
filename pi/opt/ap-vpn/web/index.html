@@ -102,6 +102,13 @@ function setProfile(slot, name, from) {
   if (from) promptDo(`"${name}" is currently on ${from} (${ssidOf(from)}). TAKE it from there and give it to ${slot} (${ssidOf(slot)})?\n${from} will be left WITHOUT A TUNNEL until you assign a new profile (the kill switch holds, its clients cannot reach the internet).`, `${ssidOf(slot)} / ${ssidOf(from)}`, `${slot} → ${name}`, c=>api(`/api/slot/${slot}/profile`,{method:'POST',body:{name,force:true,confirm:c}}), showSummary);
   else promptDo(`Switch ${slot} (${ssidOf(slot)}) to the profile "${name}"?\nThe tunnel is rebuilt; this SSID's clients lose connectivity for a few seconds (nothing leaks). If no handshake arrives, the previous profile is restored.`, ssidOf(slot), `${slot} → ${name}`, c=>api(`/api/slot/${slot}/profile`,{method:'POST',body:{name,confirm:c}}), showSummary);
 }
+function setMode(slot, mode){
+  const m = mode==='direct'
+    ? `Switch ${slot} (${ssidOf(slot)}) to DIRECT mode?\nClients will reach the internet through the LAN with NO VPN. The tunnel is stopped and the profile is detached.\nThey still cannot reach anything on the LAN itself.`
+    : `Switch ${slot} (${ssidOf(slot)}) to VPN mode?\nUntil you assign a profile the clients get NO internet at all (kill switch).`;
+  promptDo(m, ssidOf(slot), `${slot} → ${mode}`, c=>api(`/api/slot/${slot}/mode`,{method:'POST',body:{mode,confirm:c}}), async r=>{ await refreshAll(); toast(`${slot}: ${r.mode}`,'ok'); });
+}
+function syncRadio(slot){ act(`${slot} radio`, ()=>api(`/api/slot/${slot}/sync`,{method:'POST'}), async r=>{ await refreshAll(); toast(r.msg||'ok','ok'); }); }
 function rePin(slot){ promptDo(`Pin the CURRENT state of ${slot} (SSID, profile, server key, radio MAC) and start the SSID?\nRight now: ${ssidOf(slot)} → ${profOf(slot)}`, ssidOf(slot), `pin ${slot}`, c=>api(`/api/slot/${slot}/pin`,{method:'POST',body:{confirm:c}}), async r=>{ await refreshStatus(); render(); toast(`Pinned: ${r.msg||''}`,'ok'); }); }
 async function showSummary(r){ EXIT={}; await refreshAll(); if(r?.summary) toast(r.summary.join('\n'), 'ok'); }
 function swapSlots(a,b){ promptDo(`${a} ⇄ ${b}: swap the VPN profiles of the two SSIDs?\n${ssidOf(a)} → ${profOf(b)}\n${ssidOf(b)} → ${profOf(a)}\nClients of both SSIDs lose connectivity briefly. This can take 1-3 minutes.`, `${ssidOf(a)} / ${ssidOf(b)}`, `${a} ⇄ ${b}`, c=>api('/api/swap',{method:'POST',body:{a,b,confirm:c}}), showSummary); }
@@ -127,21 +134,27 @@ function render(){
     for (const sl of s.slots) {
       const healthy = sl.enabled && sl.ap.up && sl.vpn.healthy && sl.killswitch;
       const other = s.slots.length===2 ? s.slots.find(x=>x.name!==sl.name) : null;
+      const direct = sl.mode==='direct';
       const opts = PROFILES.map(p => { const mine = p.slot===sl.name, used = p.slot && !mine; return `<option value="${esc(p.name)}" data-from="${esc(p.slot||'')}" ${mine?'selected':''}>${esc(p.name)}${mine?' (this SSID)':used?` — taken from ${esc(p.slot)}`:''}</option>`; }).join('');
+      const radio = sl.radio||{};
       h += `<div class="card"><div class="h"><span class="dot ${healthy?'ok':sl.enabled?'warn':''}"></span><b class="mono">${esc(sl.name)}</b><span class="k">${healthy?'healthy':sl.enabled?'problem':'off'}</span><span class="sp" style="flex:1"></span>
         <span class="k">SSID</span><button class="switch ${sl.enabled?'on':''}" onclick="toggleSlot('${esc(sl.name)}',${!sl.enabled})" title="${sl.enabled?'Turn off':'Turn on'}"><i></i></button></div>
         <div class="slot">
           <div class="col"><span class="k">Wi-Fi</span><span class="big">${esc(sl.ap.ssid)}</span><span class="mono k">${esc(sl.ap.band)} · channel ${sl.ap.channel} · ${sl.ap.width_mhz ?? "?"} MHz · ${esc(sl.ap.if)}</span>
+            <span class="mono k" title="This slot follows this radio, not the interface name">📻 ${esc(radio.mac||'—')}${radio.driver?' · '+esc(radio.driver):''}${radio.present===false?' <b style="color:var(--bad)">device missing</b>':''}${radio.present===false?` <button class="btn s" onclick="syncRadio('${esc(sl.name)}')">Find it</button>`:''}</span>
             <span><span class="dot ${sl.ap.up?'ok':'bad'}"></span> ${sl.ap.up?'on the air':'DOWN'} <span class="k">· ${sl.clients} clients · ${esc(sl.net)}</span></span></div>
-          <div class="col"><span class="k">VPN exit</span>
+          <div class="col"><span class="k">Exit</span>
+            <div class="row"><span class="tag ${direct?'':'ok'}">${direct?'DIRECT · no VPN':'VPN only'}</span>
+              <button class="btn s" onclick="setMode('${esc(sl.name)}','${direct?'vpn':'direct'}')" ${sl.enabled?'':'disabled'}>${direct?'Put behind a VPN':'Switch to direct'}</button></div>
+            ${direct ? `<span class="k">Clients exit through the LAN (${esc(ST.lan.if||'')}) with no tunnel. They still cannot reach the LAN itself.</span>` : `
             <div class="row"><select id="prof-${esc(sl.name)}" ${sl.enabled?'':'disabled'}><option value="">— select a profile —</option>${opts}</select>
               <button class="btn s p" onclick="(()=>{const o=$('#prof-${esc(sl.name)}').selectedOptions[0]; if(!o||!o.value) return; if(o.dataset.from==='${esc(sl.name)}') return toast('Already this profile'); setProfile('${esc(sl.name)}', o.value, o.dataset.from||null);})()" ${sl.enabled?'':'disabled'}>Apply</button>
-              ${other?`<button class="btn s" onclick="swapSlots('${esc(sl.name)}','${esc(other.name)}')" title="Swap the profiles of the two SSIDs">⇄ swap with ${esc(other.name)}</button>`:''}</div>
+              ${other && other.mode!=='direct' ?`<button class="btn s" onclick="swapSlots('${esc(sl.name)}','${esc(other.name)}')" title="Swap the profiles of the two SSIDs">⇄ swap with ${esc(other.name)}</button>`:''}</div>
             <span><span class="dot ${sl.vpn.healthy?'ok':'bad'}"></span> ${sl.vpn.healthy?`handshake ${fmtD(sl.vpn.handshakeAge??sl.vpn.handshake_age_s??0)} ago`:'no tunnel'} <span class="mono k">· ${esc(sl.vpn.endpoint||'-')} · ${esc(sl.vpn.if)} ${esc(sl.vpn.address||'')}</span></span>
-            <span class="k">↓${fmtB(sl.vpn.rx_bytes)} ↑${fmtB(sl.vpn.tx_bytes)}</span>
+            <span class="k">↓${fmtB(sl.vpn.rx_bytes)} ↑${fmtB(sl.vpn.tx_bytes)}</span>`}
             <div class="row"><span class="k">Exit IP:</span><b class="mono">${esc(EXIT[sl.name]||'—')}</b><button class="btn s" onclick="exitIP('${esc(sl.name)}')" ${sl.vpn.up?'':'disabled'}>Query</button></div></div>
           <div class="col" style="align-items:flex-end"><span class="tag ${sl.killswitch?'ok':'bad'}">${sl.killswitch?'✓ kill switch':'✗ NO kill switch'}</span>
-            <span class="tag ${sl.pin?.ok?'ok':'bad'}" title="${esc(sl.pin?.msg||'')}">${sl.pin?.ok?(sl.pin.pinned?`🔒 pinned: ${esc(sl.pin.profile)}`:'not pinned (no profile assigned)'):'⚠ PIN VIOLATION'}</span></div>
+            <span class="tag ${sl.pin?.ok?'ok':'bad'}" title="${esc(sl.pin?.msg||'')}">${sl.pin?.ok?(sl.pin.pinned?`🔒 pinned: ${esc(sl.pin.profile||sl.mode)}`:'not pinned'):'⚠ PIN VIOLATION'}</span></div>
         </div>
         ${sl.pin && !sl.pin.ok ? `<div class="viol"><b>ASSIGNMENT VIOLATION — the SSID was stopped (fail-closed).</b> ${esc(sl.pin.violation||sl.pin.msg)}<br><span class="k">If you did not make this change, investigate first. If the current state is correct:</span> <button class="btn s" onclick="rePin('${esc(sl.name)}')">Re-pin</button></div>` : ''}
         </div>`;

@@ -8,6 +8,7 @@ struct SlotsView: View {
     @State private var pendingSwap: (a: String, b: String)? = nil
     @State private var pendingToggle: (slot: String, on: Bool)? = nil
     @State private var pendingPin: String? = nil
+    @State private var pendingMode: (slot: String, mode: String)? = nil
     @State private var typed = ""          // typed confirmation (also enforced on the Pi; guards against a mis-click)
     var s: Status { app.status }
 
@@ -74,6 +75,19 @@ struct SlotsView: View {
                 Text("The CURRENT state of this SSID (SSID, profile, server key, radio MAC) is stored as the pin.\nRight now: \(app.ssid(of: p)) → \(s.slots.first { $0.name == p }?.vpn.profile ?? "—")\nIf you did not make this change, investigate first.\n\nTo confirm, type exactly:\n\(pinExpected)")
             }
         }
+        .alert("Switch \(pendingMode?.slot ?? "") to \(pendingMode?.mode ?? "") mode?",
+               isPresented: Binding(get: { pendingMode != nil }, set: { if !$0 { pendingMode = nil; typed = "" } })) {
+            TextField(modeExpected, text: $typed)
+            Button(pendingMode?.mode == "direct" ? "Switch to direct" : "Put behind a VPN") {
+                if let m = pendingMode { app.setMode(m.slot, m.mode, confirm: typed.trimmingCharacters(in: .whitespaces)) }
+                pendingMode = nil; typed = ""
+            }.disabled(typed.trimmingCharacters(in: .whitespaces) != modeExpected)
+            Button("Cancel", role: .cancel) { pendingMode = nil; typed = "" }
+        } message: {
+            Text(pendingMode?.mode == "direct"
+                 ? "Clients will reach the internet through the LAN with NO VPN. The tunnel is stopped and the profile is detached. They still cannot reach anything on the LAN itself.\n\nTo confirm, type exactly:\n\(modeExpected)"
+                 : "Until you assign a profile, clients get NO internet at all (the kill switch holds).\n\nTo confirm, type exactly:\n\(modeExpected)")
+        }
         .confirmationDialog("Turn \(pendingToggle?.slot ?? "") \(pendingToggle?.on == true ? "on" : "off")?",
                             isPresented: Binding(get: { pendingToggle != nil }, set: { if !$0 { pendingToggle = nil } })) {
             Button(pendingToggle?.on == true ? "Turn on" : "Turn off", role: pendingToggle?.on == true ? nil : .destructive) {
@@ -85,6 +99,7 @@ struct SlotsView: View {
     var activateExpected: String { pendingActivate.map { app.confirmText([$0.slot] + ($0.stealFrom.map { [$0] } ?? [])) } ?? "" }
     var swapExpected: String { pendingSwap.map { app.confirmText([$0.a, $0.b]) } ?? "" }
     var pinExpected: String { pendingPin.map { app.ssid(of: $0) } ?? "" }
+    var modeExpected: String { pendingMode.map { app.ssid(of: $0.slot) } ?? "" }
 
     @ViewBuilder
     func slotCard(_ slot: Slot) -> some View {
@@ -96,7 +111,16 @@ struct SlotsView: View {
                 VStack(alignment: .leading, spacing: 5) {
                     Label("Wi-Fi", systemImage: "wifi").font(.caption).foregroundStyle(.secondary)
                     Text(slot.ap.ssid).font(.title3).bold()
-                    Text("\(slot.ap.band) · kanal \(slot.ap.channel) · \(slot.ap.width) MHz · \(slot.ap.iface)").font(.caption).monospaced().foregroundStyle(.secondary)
+                    Text("\(slot.ap.band) · channel \(slot.ap.channel) · \(slot.ap.width) MHz · \(slot.ap.iface)").font(.caption).monospaced().foregroundStyle(.secondary)
+                    HStack(spacing: 5) {
+                        Image(systemName: "antenna.radiowaves.left.and.right").font(.caption2)
+                        Text(slot.radio.mac ?? "—").font(.caption).monospaced()
+                        if let d = slot.radio.driver { Text(d).font(.caption2).foregroundStyle(.secondary) }
+                        if !slot.radio.present {
+                            Text("device missing").font(.caption2).foregroundStyle(.red)
+                            Button("Find it") { app.syncRadio(slot.name) }.controlSize(.mini)
+                        }
+                    }.help("This slot is bound to this radio, not to the interface name")
                     HStack(spacing: 6) {
                         Circle().fill(slot.ap.up ? .green : .red).frame(width: 8, height: 8)
                         Text(slot.ap.up ? "on the air" : "DOWN").font(.callout)
@@ -107,7 +131,18 @@ struct SlotsView: View {
                 Divider()
                 // tunnel
                 VStack(alignment: .leading, spacing: 5) {
-                    Label("VPN exit", systemImage: "lock.shield").font(.caption).foregroundStyle(.secondary)
+                    Label("Exit", systemImage: slot.isDirect ? "network" : "lock.shield").font(.caption).foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Text(slot.isDirect ? "DIRECT · no VPN" : "VPN only")
+                            .font(.caption).bold().foregroundStyle(slot.isDirect ? .orange : .green)
+                        Button(slot.isDirect ? "Put behind a VPN" : "Switch to direct") {
+                            pendingMode = (slot.name, slot.isDirect ? "vpn" : "direct")
+                        }.controlSize(.small).disabled(app.busy != nil || !slot.enabled)
+                    }
+                    if slot.isDirect {
+                        Text("Clients exit through the LAN with no tunnel. They still cannot reach the LAN itself.")
+                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    } else {
                     HStack {
                         Menu {
                             ForEach(app.profiles) { p in
@@ -135,6 +170,7 @@ struct SlotsView: View {
                         Text("Exit IP:").font(.callout).foregroundStyle(.secondary)
                         Text(app.exitIP[slot.name] ?? "—").font(.callout).monospaced().bold()
                         Button("Query") { app.fetchExitIP(slot.name) }.controlSize(.small).disabled(app.busy != nil || !slot.vpn.up)
+                    }
                     }
                 }
                 .frame(minWidth: 260, alignment: .leading)

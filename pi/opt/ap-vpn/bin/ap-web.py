@@ -121,6 +121,10 @@ def clients(): return api(apctl.clients, request.args.get('slot'))
 @auth
 def profiles(): return api(apctl.vpn_list)
 
+@app.get('/api/devices')
+@auth
+def devices(): return api(apctl.devices)
+
 @app.get('/api/wifi/<slot>')
 @auth
 def wifi_get(slot): return api(apctl.wifi_get, slot)
@@ -153,6 +157,20 @@ def swap():
 @auth
 def slot_pin(slot):
     b = body(); return api(apctl.slot_pin, slot, b.get('confirm'))
+
+@app.post('/api/slot/<slot>/mode')
+@auth
+def slot_mode(slot):
+    b = body(); return api(apctl.slot_mode, slot, b.get('mode'), b.get('confirm'))
+
+@app.post('/api/slot/<slot>/bind')
+@auth
+def slot_bind(slot):
+    b = body(); return api(apctl.slot_bind, slot, b.get('target'), b.get('confirm'))
+
+@app.post('/api/slot/<slot>/sync')
+@auth
+def slot_sync(slot): return api(apctl.slot_sync, slot)
 
 @app.post('/api/wifi/<slot>')
 @auth

@@ -24,6 +24,8 @@ The layers are independent; a leak requires all of them to fail at once.
 | 5 | `ap-hostapd@ Requires=ap-firewall` | An SSID without rules |
 | 6 | `ap-hostapd@ ExecStartPre=ap-pin.sh check` | An SSID bound to the wrong tunnel |
 | 7 | Watchdog `ap-pin.sh enforce` (every minute) | Drift at runtime |
+| 8 | `MODE` is pinned; `vpn` slots get no LAN default route and no `AP → LAN` rule, and the firewall self-check aborts if either appears | A VPN-backed SSID quietly exiting through the local network |
+| 9 | `AP_MAC` is pinned and resolved before the slot starts | Another adapter taking over an SSID and its tunnel |
 
 Layers 1 and 2 are both required: without 1, layer 2 holds when the table empties; without 2, layer 1 holds if a rule is deleted. `ap-verify` proves each of them separately.
 
@@ -32,11 +34,14 @@ Layers 1 and 2 are both required: without 1, layer 2 holds when the table emptie
 Every slot carries a four-part pin:
 
 ```
+PIN_MODE       the exit mode: vpn (tunnel only) or direct (LAN, no VPN)
 PIN_SSID_HEX   the SSID (hex; safe for spaces/special characters)
-PIN_PROFILE    the assigned profile name
+PIN_PROFILE    the assigned profile name (empty in direct mode)
 PIN_PEER       the VPN server's public key from that profile
-AP_MAC         the radio's MAC address
+AP_MAC         the radio's MAC address — the slot's identity
 ```
+
+In `direct` mode the pin asserts the opposite of the usual: no profile may be attached and no tunnel may be running for that slot. A slot is never half in both modes.
 
 `ap-pin.sh check <slot>` compares the live state with the pin: `PROFILE` in the env, `ssid` in the hostapd conf, `PublicKey` in the profile file, `PublicKey` in `/etc/wireguard/wgN.conf`, the running tunnel's peer, and `/sys/class/net/<if>/address`. Any mismatch returns exit code 1.
 
@@ -80,6 +85,21 @@ afterwards: counter(8B) ‖ ChaCha20-Poly1305(K, nonce = direction(4B) ‖ count
 ## Location leakage
 
 The VPN hides the IP; it does **not** hide the BSSID. A phone with location services enabled reports nearby SSIDs/BSSIDs to its positioning provider, and if they are in the database the physical location is known. The `_nomap` suffix is the opt-out convention honoured by Google, Mozilla and Apple; `ap-slot-new.sh` uses it by default. Nothing can be done about the neighbours' BSSIDs — location services must be turned off on the client device.
+
+## Choosing an exit mode
+
+`direct` is a real exit, not a degraded one: the clients reach the internet through the LAN, exactly like any other device on it, and the Pi's own address is what the outside world sees. What it still prevents: the guests cannot reach the LAN's hosts, the other SSIDs, or anything on the Pi beyond DHCP and DNS.
+
+Use it when the SSID is meant to be an ordinary guest network. Do not use it for the case this project was built for — hiding the client's address — because with `direct` there is nothing to hide behind.
+
+Switching is deliberate in both directions:
+
+```bash
+sudo ap-ctl --slot ap1 slot mode direct --confirm '<SSID of ap1>'   # no VPN from now on
+sudo ap-ctl --slot ap1 slot mode vpn    --confirm '<SSID of ap1>'   # back; no internet until a profile is assigned
+```
+
+Going to `vpn` deliberately leaves the slot without internet until you assign a profile. That is the safe direction: an SSID that was exposed stops working rather than silently continuing without the tunnel.
 
 ## What this project does **not** do
 

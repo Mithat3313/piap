@@ -1,0 +1,14 @@
+[Unit]
+Description=AP slot %i: resolve the radio by MAC and align the config
+# Runs before ap-wlan@%i so that unit reads an already-correct AP_IF from the slot env.
+# udev can take a few seconds to bring a USB radio up at boot, so the script itself waits for the
+# MAC (IFSYNC_WAIT half-seconds) rather than failing immediately.
+After=systemd-udevd.service network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+# Exits non-zero when the slot's radio never appears: ap-wlan@ and ap-hostapd@ then stay down (fail closed).
+ExecStart=/opt/ap-vpn/bin/ap-ifsync.sh sync %i
+TimeoutStartSec=60

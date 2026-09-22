@@ -111,7 +111,7 @@ if [ "$OK" != 1 ]; then
 fi
 
 # --- move dnsmasq's upstream to the new tunnel address ---
-sed -i -E "s/^(server=[0-9.]+)@.*/\1@${NEWIP}/" "$DNSMASQ_CONF"
+sed -i -E "s/^(server=[0-9.]+)(@.*)?$/\1@${NEWIP}/" "$DNSMASQ_CONF"
 grep "^server=" "$DNSMASQ_CONF"
 systemctl restart "$DNSMASQ_UNIT"
 

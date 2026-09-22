@@ -1,7 +1,9 @@
 [Unit]
 Description=AP slot %i: interface address + disable IPv6
-After=network-pre.target
+After=network-pre.target ap-ifsync@%i.service
 Wants=network-pre.target
+# The radio is resolved by MAC first, so this unit always configures the right interface.
+Requires=ap-ifsync@%i.service
 
 [Service]
 Type=oneshot

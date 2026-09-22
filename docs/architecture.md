@@ -6,7 +6,8 @@ The basic unit of the system is a **slot**. A slot ties together:
 
 | Component | Example (ap0) | Example (ap1) |
 |---|---|---|
-| Radio | `wlan0` (built-in, 5 GHz) | `wlan1` (USB, 2.4 GHz) |
+| Radio (identity = MAC) | `wlan0` (built-in, 5 GHz) | `wlan1` (USB, 2.4 GHz) |
+| Exit mode | `vpn` | `vpn` or `direct` |
 | SSID | `PiAP-ap0_nomap` | `PiAP-ap1_nomap` |
 | Subnet | `10.99.0.0/24`, gw `.1`, DHCP `.50–.200` | `10.98.0.0/24` |
 | Tunnel | `wg0` | `wg1` |
@@ -14,15 +15,28 @@ The basic unit of the system is a **slot**. A slot ties together:
 | `ip rule` priorities | 1000 / 1001 / 1002 | 1010 / 1011 / 1012 |
 | Profile | `server-a` | `server-b` |
 
-A slot is defined in `/etc/ap-vpn/slots/<slot>.env`; every script and `apctl` reads that file. `ap-slot-new.sh apN …` derives the table (`51820+N`), the priorities (`1000+10N`), the tunnel name (`wgN`) and the subnet (`10.(99−N).0.0/24`) from the slot number.
+A slot is defined in `/etc/ap-vpn/slots/<slot>.env`; every script and `apctl` reads that file.
+
+**The radio, not the name.** `AP_MAC` is the slot's identity. Kernel names depend on enumeration order, so `ap-ifsync.sh sync <slot>` runs before the slot comes up (unit `ap-ifsync@`): it finds the interface currently carrying that MAC and rewrites `AP_IF` plus the `interface=` lines of the slot's hostapd and dnsmasq configs. Three outcomes, all deliberate:
+
+| Situation | Result |
+|---|---|
+| Same MAC, different name | The name is updated; the slot keeps its subnet, SSID and exit |
+| Different MAC on the old name | Refused — the SSID stays down. A new adapter never inherits another's VPN; give it its own slot with `ap-slot-new.sh` (or rebind explicitly with `ap-ctl --slot X slot bind <mac>`) |
+| The MAC is absent | `ap-ifsync` exits non-zero, so `ap-wlan@` and `ap-hostapd@` do not start (fail closed) |
+
+**Two exit modes.** `MODE=vpn` (default) routes the slot only into its own tunnel. `MODE=direct` routes it out through the LAN with no tunnel at all — the SSID works immediately, which is what you want for a plain guest network. The mode is part of the pin (`PIN_MODE`), so a `vpn` slot cannot drift into `direct`; switching is an explicit operation that detaches the profile, stops the tunnel, rewrites the resolver and re-pins.
+
+`ap-slot-new.sh apN …` derives the table (`51820+N`), the priorities (`1000+10N`), the tunnel name (`wgN`) and the subnet (`10.(99−N).0.0/24`) from the slot number.
 
 Each slot has four systemd units:
 
 ```
-ap-wlan@apN      assigns the address, disables IPv6 (oneshot)    ← ExecStartPre: ap-pin.sh iface  (radio MAC pin)
+ap-ifsync@apN    resolves the radio by MAC, aligns AP_IF and the confs (oneshot)  ← fails if the radio is absent
+ap-wlan@apN      assigns the address, disables IPv6 (oneshot)    ← Requires=ap-ifsync@; ExecStartPre: ap-pin.sh iface
 ap-dnsmasq@apN   DHCP+DNS for that subnet (its own conf file)
 ap-hostapd@apN   the SSID                                          ← Requires=ap-firewall + ap-wlan@; ExecStartPre: ap-pin.sh check
-wg-quick@wgN     the tunnel (Table = off)
+wg-quick@wgN     the tunnel (Table = off; vpn mode only)
 ```
 
 plus the global ones: `ap-firewall` (rules for all slots + self-check), `ap-watchdog.timer`, `ap-bootcheck.timer`, `ap-web`, `ap-ble-agent`.
@@ -41,7 +55,7 @@ When a client at `10.99.0.116` sends a packet to `1.2.3.4:443`:
    -i wg0   -o wlan0                                     DROP     (no new connections from the tunnel)
    -i eth0  -o wlan0                                     DROP
    ```
-3. **NAT.** `AP-VPN-POST`: `-s 10.99.0.0/24 -o wg0 MASQUERADE`. Inside the tunnel the source becomes `10.66.66.x`; the VPN server sees a single client.
+3. **NAT.** `AP-VPN-POST`: `-s 10.99.0.0/24 -o wg0 MASQUERADE`. Inside the tunnel the source becomes `10.66.66.x`; the VPN server sees a single client. In `direct` mode the same rule masquerades to the LAN interface instead, and the RFC1918 drops above it keep the guests off the LAN's own hosts.
 4. **MSS.** `AP-VPN-MSS` (mangle FORWARD): `--set-mss $((MTU−40))` for both `-i wlan0 -o wg0` and `-i wg0 -o wlan0`. A fixed value — `--clamp-mss-to-pmtu` miscalculates in the return direction (see troubleshooting).
 
 DNS: the client asks `10.99.0.1:53` (DHCP says so; if it asks any other address, `AP-VPN-PRE` REDIRECTs it to `10.99.0.1`). dnsmasq runs with `no-resolv` and only `server=1.1.1.1@10.66.66.x`: the query leaves **from the tunnel's source address**, so `ip rule 1000: from 10.66.66.x lookup 51820` sends it into the tunnel. If the tunnel is down, binding to that address fails — the query never reaches the ISP.
