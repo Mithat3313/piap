@@ -169,7 +169,7 @@ struct SlotsView: View {
                     HStack(spacing: 8) {
                         Text("Exit IP:").font(.callout).foregroundStyle(.secondary)
                         Text(app.exitIP[slot.name] ?? "—").font(.callout).monospaced().bold()
-                        Button("Query") { app.fetchExitIP(slot.name) }.controlSize(.small).disabled(app.busy != nil || !slot.vpn.up)
+                        Button("Query") { app.fetchExitIP(slot.name) }.controlSize(.small).disabled(app.busy != nil || !(slot.vpn.up || slot.isDirect))
                     }
                     }
                 }

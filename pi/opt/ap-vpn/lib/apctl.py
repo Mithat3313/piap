@@ -606,12 +606,20 @@ def _slot_enable_impl(slot, enabled):
 
 
 def exit_ip(slot=None):
-    s = _slot(slot); addr = _iface_ip(s['WG_IF'])
+    """What the outside world sees for this slot: the tunnel's exit in vpn mode, the LAN's own public
+    address in direct mode (there the clients are simply NATed out like any other device on the LAN)."""
+    s = _slot(slot)
+    if s.get('MODE', 'vpn') == 'direct':
+        lan = _env().get('LAN_IF', 'eth0')
+        rc, out, err = _run(['/usr/bin/curl', '-4', '-s', '-m', '8', '--interface', lan, 'https://api.ipify.org'], 12)
+        if rc != 0 or not out.strip(): raise ApError('could not read the exit IP (no internet on the LAN?)')
+        return {'slot': s['SLOT'], 'exit_ip': out.strip(), 'via': lan, 'mode': 'direct'}
+    addr = _iface_ip(s['WG_IF'])
     if not addr: raise ApError(f"no address on interface {s['WG_IF']}")
     src = addr.split('/')[0]
     rc, out, err = _run(['/usr/bin/curl', '-4', '-s', '-m', '8', '--interface', src, 'https://api.ipify.org'], 12)
     if rc != 0 or not out.strip(): raise ApError('could not read the exit IP (the tunnel may be down)')
-    return {'slot': s['SLOT'], 'exit_ip': out.strip(), 'via': src}
+    return {'slot': s['SLOT'], 'exit_ip': out.strip(), 'via': src, 'mode': 'vpn'}
 
 
 # ----------------------------------------------------------------- system

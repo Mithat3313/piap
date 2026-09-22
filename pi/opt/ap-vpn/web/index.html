@@ -152,7 +152,7 @@ function render(){
               ${other && other.mode!=='direct' ?`<button class="btn s" onclick="swapSlots('${esc(sl.name)}','${esc(other.name)}')" title="Swap the profiles of the two SSIDs">⇄ swap with ${esc(other.name)}</button>`:''}</div>
             <span><span class="dot ${sl.vpn.healthy?'ok':'bad'}"></span> ${sl.vpn.healthy?`handshake ${fmtD(sl.vpn.handshakeAge??sl.vpn.handshake_age_s??0)} ago`:'no tunnel'} <span class="mono k">· ${esc(sl.vpn.endpoint||'-')} · ${esc(sl.vpn.if)} ${esc(sl.vpn.address||'')}</span></span>
             <span class="k">↓${fmtB(sl.vpn.rx_bytes)} ↑${fmtB(sl.vpn.tx_bytes)}</span>`}
-            <div class="row"><span class="k">Exit IP:</span><b class="mono">${esc(EXIT[sl.name]||'—')}</b><button class="btn s" onclick="exitIP('${esc(sl.name)}')" ${sl.vpn.up?'':'disabled'}>Query</button></div></div>
+            <div class="row"><span class="k">Exit IP:</span><b class="mono">${esc(EXIT[sl.name]||'—')}</b><button class="btn s" onclick="exitIP('${esc(sl.name)}')" ${(direct||sl.vpn.up)?'':'disabled'}>Query</button></div></div>
           <div class="col" style="align-items:flex-end"><span class="tag ${sl.killswitch?'ok':'bad'}">${sl.killswitch?'✓ kill switch':'✗ NO kill switch'}</span>
             <span class="tag ${sl.pin?.ok?'ok':'bad'}" title="${esc(sl.pin?.msg||'')}">${sl.pin?.ok?(sl.pin.pinned?`🔒 pinned: ${esc(sl.pin.profile||sl.mode)}`:'not pinned'):'⚠ PIN VIOLATION'}</span></div>
         </div>
