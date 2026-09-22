@@ -210,7 +210,11 @@ final class BLEClient: NSObject, ObservableObject {
             c2pNext = 0; p2cLast = -1
             state = .ready; note("ready — encrypted session (MTU \(mtu))")
         } catch {
-            state = .error("handshake: \(error.localizedDescription)"); note("handshake error: \(error)")
+            note("handshake error: \(error)")
+            // Release the link. A half-open link (for example after the Pi's agent restarted and our cached GATT
+            // handles went stale) would otherwise stay open and block every later attempt from this Mac.
+            disconnect()
+            state = .error("handshake failed: \(error.localizedDescription) — disconnected, try again")
         }
     }
 
@@ -312,7 +316,7 @@ extension Data {
 // MARK: - CBCentralManagerDelegate
 extension BLEClient: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ c: CBCentralManager) {
-        note("BT durumu: \(c.state.rawValue)")
+        note("BT state: \(c.state.rawValue)")
         switch c.state {
         case .poweredOn: if state == .off || state == .starting { state = .idle }
         case .unauthorized: state = .error("Bluetooth permission denied (System Settings → Privacy → Bluetooth)")
@@ -323,7 +327,7 @@ extension BLEClient: CBCentralManagerDelegate {
     func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral, advertisementData: [String: Any], rssi: NSNumber) {
         let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? p.name ?? "PiAP"
         if let i = found.firstIndex(where: { $0.id == p.identifier }) { found[i].rssi = rssi.intValue }
-        else { found.append(Found(id: p.identifier, name: name, rssi: rssi.intValue)); note("bulundu: \(name) rssi=\(rssi)") }
+        else { found.append(Found(id: p.identifier, name: name, rssi: rssi.intValue)); note("found: \(name) rssi=\(rssi)") }
     }
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
         state = .discovering; note("connected, discovering services"); p.discoverServices([Self.serviceUUID])
@@ -344,8 +348,8 @@ extension BLEClient: CBPeripheralDelegate {
     }
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor s: CBService, error: Error?) {
         rx = s.characteristics?.first { $0.uuid == Self.rxUUID }; tx = s.characteristics?.first { $0.uuid == Self.txUUID }
-        guard let tx, rx != nil else { state = .error("karakteristikler eksik"); return }
-        mtu = p.maximumWriteValueLength(for: .withResponse); note("karakteristikler OK, MTU(write)=\(mtu)")
+        guard let tx, rx != nil else { state = .error("characteristics missing"); return }
+        mtu = p.maximumWriteValueLength(for: .withResponse); note("characteristics OK, MTU(write)=\(mtu)")
         state = .pairing; p.setNotifyValue(true, for: tx)
     }
     func peripheral(_ p: CBPeripheral, didUpdateNotificationStateFor ch: CBCharacteristic, error: Error?) {

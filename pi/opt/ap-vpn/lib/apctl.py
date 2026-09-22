@@ -298,8 +298,12 @@ def _wifi_set_impl(slot=None, ssid=None, psk=None):
     if rc != 0 or not _active(s['HOSTAPD_UNIT']):
         shutil.copy2(bak, path)
         if ssid is not None and old_pin: _set_env_key(env_path, 'PIN_SSID_HEX', old_pin)
-        _restart_hostapd(s)
+        _restart_hostapd(s); _run([FIREWALL], 60)
         raise ApError(f'hostapd did not start with the new settings, rolled back: {err.strip()[:200]}')
+    # Stopping hostapd takes the radio down, and the kernel drops (or marks linkdown) the AP's link route in the
+    # slot's routing table. Without it dnsmasq's replies are routed into the tunnel and clients resolve nothing,
+    # so the firewall has to be re-applied after every restart. Idempotent.
+    _run([FIREWALL], 60)
     return wifi_get(s['SLOT'])
 
 

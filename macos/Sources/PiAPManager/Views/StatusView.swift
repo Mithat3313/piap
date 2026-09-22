@@ -92,7 +92,7 @@ struct SlotsView: View {
         GroupBox {
           VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top, spacing: 18) {
-                // radyo
+                // radio
                 VStack(alignment: .leading, spacing: 5) {
                     Label("Wi-Fi", systemImage: "wifi").font(.caption).foregroundStyle(.secondary)
                     Text(slot.ap.ssid).font(.title3).bold()
@@ -253,9 +253,9 @@ struct WiFiView: View {
             } header: { Text("Guest network — \(slot)") } footer: {
                 Text("Applying restarts only this SSID's hostapd; its clients are dropped. The other SSID and Bluetooth are unaffected.")
             }
-            SwiftUI.Section("Radyo") {
+            SwiftUI.Section("Radio") {
                 LabeledContent("Interface", value: cur.iface.isEmpty ? "—" : cur.iface)
-                LabeledContent("Bant / kanal", value: cur.band.isEmpty ? "—" : "\(cur.band) · kanal \(cur.channel)")
+                LabeledContent("Band / channel", value: cur.band.isEmpty ? "—" : "\(cur.band) · channel \(cur.channel)")
                 LabeledContent("VPN exit", value: app.status.slots.first { $0.name == slot }?.vpn.profile ?? "—")
             }
             SwiftUI.Section {

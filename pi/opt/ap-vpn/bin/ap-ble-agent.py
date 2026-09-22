@@ -125,6 +125,7 @@ class Sessions:
 
 
 SESS = Sessions()
+STALE_LINK_S = 45          # a central that connects but does not authenticate within this many seconds is disconnected
 LONG_LOCK = threading.Lock()
 LONG_OPS = {'vpn.activate', 'vpn.swap', 'vpn.add', 'verify', 'wifi.set', 'exitip', 'firewall', 'agent.update', 'slot.enable', 'slot.disable', 'slot.pin'}
 
@@ -422,7 +423,20 @@ def main():
         return True
     GLib.timeout_add_seconds(60, adv_refresh)
 
-    # ---- single session: disconnect a second central while an authenticated session exists; drop the session of whoever leaves
+    # ---- single session: disconnect a second central while an authenticated session exists; drop the session of whoever leaves.
+    # A central that connects but never authenticates is also disconnected after STALE_LINK_S. Without this, a client whose
+    # cached GATT handles went stale (this agent restarted while it was connected) holds the link open forever and every
+    # later attempt from that machine reuses the same dead link: the app looks like it "cannot connect".
+    def drop_if_unauthed(p):
+        s = SESS.s.get(p)
+        if s is not None and s.authed: return False
+        try:
+            d = dbus.Interface(bus.get_object(BLUEZ, p), IFACE_DEVICE)
+            if bool(dbus.Interface(bus.get_object(BLUEZ, p), DBUS_PROP).Get(IFACE_DEVICE, 'Connected')):
+                d.Disconnect(); log(f'{p}: connected {STALE_LINK_S}s without authenticating - link dropped')
+        except Exception as e: log('stale-link disconnect error', e)
+        return False
+
     def on_props(iface, changed, invalidated, path=None):
         if iface != IFACE_DEVICE or 'Connected' not in changed: return
         p = str(path)
@@ -430,6 +444,8 @@ def main():
             if SESS.authed_other(p):
                 try: dbus.Interface(bus.get_object(BLUEZ, p), IFACE_DEVICE).Disconnect(); log(f'{p}: second central disconnected')
                 except Exception as e: log('disconnect error', e)
+            else:
+                GLib.timeout_add_seconds(STALE_LINK_S, drop_if_unauthed, p)
         else:
             SESS.drop(p); log(f'{p}: disconnected, session dropped')
     bus.add_signal_receiver(on_props, dbus_interface=DBUS_PROP, signal_name='PropertiesChanged', path_keyword='path')

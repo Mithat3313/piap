@@ -41,6 +41,13 @@ if ! $IP rule show | grep -q "from ${AP_NET} blackhole"; then
   logger -t ap-watchdog -p daemon.err "KILL SWITCH BROKEN: no blackhole rule - re-applying the firewall"
   /opt/ap-vpn/bin/ap-firewall.sh >/dev/null 2>&1
 fi
+# The AP's own link route lives in the same table. It disappears whenever the AP address is flushed and
+# re-added, and without it dnsmasq's replies are routed into the tunnel: clients associate, get a lease and
+# then resolve nothing. Not a leak, but it looks exactly like a broken network.
+if ! $IP route show table "$TABLE" | grep -q "^${AP_NET} dev ${AP_IF}"; then
+  logger -t ap-watchdog -p daemon.warning "AP link route for ${AP_NET} missing in table $TABLE - re-applying the firewall"
+  /opt/ap-vpn/bin/ap-firewall.sh >/dev/null 2>&1
+fi
 
 # --- 3. Handshake age ---
 NOW=$(date +%s)
