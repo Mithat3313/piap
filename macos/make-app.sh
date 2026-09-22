@@ -10,6 +10,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/PiAPManager"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+[ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"   # ./make-icon.swift regenerates it
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 codesign --force --deep -s - "$APP" >/dev/null 2>&1
 echo "OK: $(pwd)/$APP"
