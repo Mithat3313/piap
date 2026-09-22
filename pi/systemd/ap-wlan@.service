@@ -1,0 +1,22 @@
+[Unit]
+Description=AP slot %i: arayuz adresi + IPv6 kapatma
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/ap-vpn/slots/%i.env
+ExecStartPre=-/usr/sbin/rfkill unblock wifi
+# radyo MAC sabiti (AP_MAC): baska adaptor/ad ise slot ayaga kalkmaz
+ExecStartPre=/opt/ap-vpn/bin/ap-pin.sh iface %i
+ExecStartPre=-/sbin/sysctl -w net.ipv6.conf.${AP_IF}.disable_ipv6=1
+ExecStartPre=-/sbin/sysctl -w net.ipv6.conf.${AP_IF}.autoconf=0
+ExecStartPre=-/sbin/sysctl -w net.ipv6.conf.${AP_IF}.accept_ra=0
+ExecStart=/sbin/ip address replace ${AP_ADDR} dev ${AP_IF}
+ExecStart=/sbin/ip link set ${AP_IF} up
+ExecStop=-/sbin/ip address flush dev ${AP_IF}
+ExecStop=-/sbin/ip link set ${AP_IF} down
+
+[Install]
+WantedBy=multi-user.target

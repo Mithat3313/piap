@@ -1,0 +1,15 @@
+[Unit]
+Description=AP-VPN web yonetim paneli (HTTPS :8443)
+After=network-online.target ap-firewall.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/ap-vpn/bin/ap-web.py
+Restart=always
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=AP-VPN BLE yonetim ajani (GATT)
+After=bluetooth.service ap-firewall.service
+Requires=bluetooth.service
+BindsTo=bluetooth.service
+# AP yoksa da calisir (ap-firewall opsiyonel) - tam da AP bozulmussa lazim.
+
+[Service]
+Type=simple
+ExecStartPre=/usr/sbin/rfkill unblock bluetooth
+ExecStartPre=-/usr/bin/timeout 5 /usr/bin/script -qc "btmgmt connectable on" /dev/null
+ExecStart=/usr/bin/python3 /opt/ap-vpn/bin/ap-ble-agent.py
+Restart=always
+RestartSec=5
+# ap-ctl hostapd/wg/dnsmasq yonetir -> root sart
+User=root
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

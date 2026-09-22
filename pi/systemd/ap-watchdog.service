@@ -1,0 +1,9 @@
+[Unit]
+Description=AP-VPN tunel watchdog (kurtarma, koruma degil)
+After=ap-firewall.service
+ConditionPathExists=!/etc/ap-vpn/DISABLED
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ap-vpn/bin/ap-watchdog.sh
+TimeoutStartSec=90

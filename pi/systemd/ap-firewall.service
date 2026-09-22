@@ -1,0 +1,17 @@
+[Unit]
+Description=AP-VPN firewall + policy routing
+# Docker ACILDIKTAN SONRA calismali: docker basladiginda DOCKER-USER
+# zincirini yeniden olusturabilir ve kurallarimizi kaybedebiliriz.
+After=network-online.target docker.service wg-quick@wg0.service wg-quick@wg1.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/ap-vpn/bin/ap-firewall.sh
+# Durdurulunca killswitch'i BIRAKMA - guvenli taraf: kurallar kalsin.
+# Tam temizlik icin /opt/ap-vpn/bin/ap-uninstall.sh kullanilir.
+ExecStop=/bin/true
+
+[Install]
+WantedBy=multi-user.target

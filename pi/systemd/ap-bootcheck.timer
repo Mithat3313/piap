@@ -1,0 +1,12 @@
+[Unit]
+Description=AP-VPN boot deadman timer
+ConditionPathExists=!/etc/ap-vpn/DISABLED
+
+[Timer]
+OnBootSec=120
+AccuracySec=10s
+RemainAfterElapse=no
+Unit=ap-bootcheck.service
+
+[Install]
+WantedBy=timers.target

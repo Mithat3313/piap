@@ -1,0 +1,23 @@
+# macOS uygulamasi
+macos/.build/
+macos/PiAPManager.app/
+macos/.v1-backup/
+macos/.swiftpm/
+*.xcodeproj/
+.DS_Store
+
+# Asla repoya girmemesi gerekenler (kurulumda Pi uzerinde uretilir)
+*.key
+*.pem
+*.psk
+*.psk.txt
+web-password
+ble-token
+profiles/*.conf
+!templates/profile-example.conf
+slots/*.env
+!templates/slot.env
+*.leases
+*.bak*
+__pycache__/
+*.pyc

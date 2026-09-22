@@ -1,0 +1,8 @@
+[Unit]
+Description=AP-VPN tunel watchdog (60sn)
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=60
+AccuracySec=10
+[Install]
+WantedBy=timers.target

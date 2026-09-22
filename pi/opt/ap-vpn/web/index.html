@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PiAP Yönetim</title>
+<style>
+:root { --bg:#0f1115; --card:#171a21; --line:#262b36; --fg:#e6e8ee; --muted:#8a93a6; --ok:#3ddc84; --bad:#ff5d5d; --warn:#ffb347; --acc:#4f8cff; }
+* { box-sizing:border-box }
+body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif }
+header { display:flex; align-items:center; gap:14px; padding:12px 20px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:2 }
+header h1 { font-size:16px; margin:0; font-weight:600 } header .sp { flex:1 }
+nav button { background:none; border:0; color:var(--muted); padding:8px 12px; border-radius:8px; cursor:pointer; font-size:14px }
+nav button.on { background:var(--card); color:var(--fg) }
+main { max-width:1100px; margin:0 auto; padding:18px 20px }
+.card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:14px }
+.slot { display:grid; grid-template-columns: 1.1fr 1.3fr auto; gap:18px; align-items:start }
+@media (max-width:820px){ .slot { grid-template-columns:1fr } }
+.h { display:flex; align-items:center; gap:8px; margin-bottom:8px } .h b { font-size:15px }
+.dot { width:9px; height:9px; border-radius:50%; background:var(--muted); display:inline-block } .dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)} .dot.warn{background:var(--warn)}
+.k { color:var(--muted); font-size:12px } .mono { font-family:ui-monospace,Menlo,monospace; font-size:12.5px } .big { font-size:20px; font-weight:600 }
+button, select, input { font:inherit }
+.btn { background:#222735; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:6px 12px; cursor:pointer } .btn:hover{ border-color:#3a4256 } .btn:disabled{ opacity:.45; cursor:default }
+.btn.p { background:var(--acc); border-color:var(--acc); color:#fff } .btn.d { color:var(--bad); border-color:#4a2a2a } .btn.s { padding:3px 8px; font-size:12px }
+select, input[type=text], input[type=password], textarea { background:#0f1115; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:6px 9px }
+textarea { width:100%; min-height:130px; font-family:ui-monospace,Menlo,monospace; font-size:12px }
+.row { display:flex; gap:8px; align-items:center; flex-wrap:wrap } .col { display:flex; flex-direction:column; gap:6px }
+.tag { font-size:11px; padding:2px 7px; border-radius:99px; background:#222735; color:var(--muted) } .tag.ok{ color:var(--ok) } .tag.bad{ color:var(--bad) }
+.viol { margin-top:10px; padding:8px 10px; border:1px solid var(--bad); border-radius:8px; color:var(--bad); font-size:12px; line-height:1.5 }
+table { width:100%; border-collapse:collapse } th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); font-size:13px } th { color:var(--muted); font-weight:500 }
+#toast { position:fixed; bottom:18px; left:50%; transform:translateX(-50%); background:#222735; border:1px solid var(--line); padding:10px 14px; border-radius:10px; max-width:720px; display:none; white-space:pre-wrap; font-size:13px; z-index:5 }
+#toast.bad { border-color:var(--bad) } #toast.ok { border-color:var(--ok) }
+#busy { position:fixed; top:56px; right:20px; background:#222735; border:1px solid var(--line); padding:6px 12px; border-radius:8px; font-size:12px; display:none; z-index:3 }
+.login { max-width:380px; margin:80px auto } .login input { width:100% } pre.log { background:#0f1115; border:1px solid var(--line); border-radius:8px; padding:10px; max-height:60vh; overflow:auto; font-size:12px }
+.switch { position:relative; width:42px; height:24px; background:#3a4256; border-radius:99px; cursor:pointer; border:0 } .switch.on { background:var(--ok) } .switch i { position:absolute; top:3px; left:3px; width:18px; height:18px; background:#fff; border-radius:50% ; transition:left .15s } .switch.on i { left:21px }
+</style>
+</head>
+<body>
+<header><h1 id="title">PiAP Yönetim</h1><nav id="nav" hidden>
+<button data-t="slots" class="on">Yayınlar</button><button data-t="clients">İstemciler</button><button data-t="wifi">Wi-Fi</button><button data-t="vpn">VPN profilleri</button><button data-t="logs">Günlük</button>
+</nav><div class="sp"></div><span id="stamp" class="k"></span><button id="logout" class="btn s" hidden>Çıkış</button></header>
+<div id="busy"></div>
+<main>
+<div id="login" class="card login">
+  <div class="h"><b>Giriş</b></div>
+  <p class="k">Web paneli parolası. Pi'de: <span class="mono">sudo ap-ctl web password</span></p>
+  <form id="loginf" class="col"><input type="password" id="pw" placeholder="Parola" autocomplete="current-password"><button class="btn p">Giriş</button></form>
+</div>
+<section id="t-slots" hidden></section>
+<section id="t-clients" hidden></section>
+<section id="t-wifi" hidden></section>
+<section id="t-vpn" hidden></section>
+<section id="t-logs" hidden></section>
+</main>
+<div id="toast"></div>
+<script>
+const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtB = b => { const u=['B','KB','MB','GB']; let v=b||0,i=0; while(v>=1024&&i<3){v/=1024;i++} return (i?v.toFixed(1):v)+' '+u[i] };
+const fmtD = s => s<60?`${s}s`:s<3600?`${Math.floor(s/60)}dk`:s<86400?`${Math.floor(s/3600)}sa ${Math.floor(s%3600/60)}dk`:`${Math.floor(s/86400)}g ${Math.floor(s%86400/3600)}sa`;
+let ST = null, PROFILES = [], WIFI = {}, CLIENTS = [], EXIT = {}, tab = 'slots', busyN = 0, timer = null;
+
+function toast(msg, cls='') { const t=$('#toast'); t.textContent=msg; t.className=cls; t.style.display='block'; clearTimeout(t._h); t._h=setTimeout(()=>t.style.display='none', cls==='bad'?9000:4000); }
+function busy(label, on) { busyN += on?1:-1; const b=$('#busy'); b.textContent = label||''; b.style.display = busyN>0?'block':'none'; }
+async function api(path, opt={}) {
+  const o = { method: opt.method||'GET', headers: {'X-Requested-With':'piap'} };
+  if (opt.body !== undefined) { o.headers['Content-Type']='application/json'; o.body = JSON.stringify(opt.body); }
+  const r = await fetch(path, o); let j={}; try { j = await r.json(); } catch(e){}
+  if (r.status === 401) { showLogin(); throw new Error('giriş gerekli'); }
+  if (!j.ok) throw new Error(j.error || `HTTP ${r.status}`);
+  return j.result;
+}
+async function act(label, fn, after) { busy(label, true); try { const r = await fn(); if (after) await after(r); return r; } catch(e) { toast(`${label}: ${e.message}`, 'bad'); } finally { busy(label, false); } }
+
+// ---------------- oturum
+function showLogin() { $('#login').hidden=false; $('#nav').hidden=true; $('#logout').hidden=true; $$('main section').forEach(s=>s.hidden=true); clearInterval(timer); timer=null; }
+function showApp() { $('#login').hidden=true; $('#nav').hidden=false; $('#logout').hidden=false; setTab(tab); if(!timer) timer=setInterval(()=>{ if(tab==='slots') refreshStatus(); }, 5000); }
+$('#loginf').onsubmit = async e => { e.preventDefault(); try { await api('/api/login',{method:'POST',body:{password:$('#pw').value}}); $('#pw').value=''; showApp(); await refreshAll(); } catch(e){ toast(e.message,'bad'); } };
+$('#logout').onclick = async () => { try{ await api('/api/logout',{method:'POST'}); }catch(e){} showLogin(); };
+$$('#nav button').forEach(b => b.onclick = () => setTab(b.dataset.t));
+function setTab(t) { tab=t; $$('#nav button').forEach(b=>b.classList.toggle('on', b.dataset.t===t)); $$('main section').forEach(s=>s.hidden = s.id!=='t-'+t); render(); if(t==='clients') refreshClients(); if(t==='wifi') refreshWifiAll(); if(t==='vpn') refreshProfiles(); }
+
+// ---------------- veri
+async function refreshStatus(){ try { ST = await api('/api/status'); $('#stamp').textContent = 'güncellendi ' + new Date().toLocaleTimeString('tr-TR'); if(tab==='slots') render(); } catch(e){ if(e.message!=='giriş gerekli') toast(e.message,'bad'); } }
+async function refreshProfiles(){ PROFILES = await api('/api/profiles'); render(); }
+async function refreshClients(){ CLIENTS = await api('/api/clients'); render(); }
+async function refreshWifiAll(){ for (const s of (ST?.slots||[])) WIFI[s.name] = await api('/api/wifi/'+s.name); render(); }
+async function refreshAll(){ await refreshStatus(); await refreshProfiles(); }
+
+// ---------------- eylemler
+const confirmDo = (msg, label, fn, after) => { if (confirm(msg)) act(label, fn, after || (async()=>{ await refreshAll(); })); };
+const ssidOf = slot => (ST?.slots||[]).find(x=>x.name===slot)?.ap?.ssid || slot;
+const profOf = slot => (ST?.slots||[]).find(x=>x.name===slot)?.vpn?.profile || '—';
+// ATAMA SABİTLEME: yayın–VPN eşlemesini değiştiren her işlem, etkilenen yayınların SSID'sinin AYNEN yazılmasını ister (Pi tarafında da zorunlu).
+function promptDo(msg, expected, label, fn, after) {
+  const typed = prompt(`${msg}\n\nBu işlem yayın–VPN eşlemesini değiştirir. Onaylamak için şu metni AYNEN yazın:\n${expected}`, '');
+  if (typed === null) return;
+  if (typed.trim() !== expected) return toast(`Onay metni eşleşmedi, işlem yapılmadı.\nBeklenen: ${expected}`, 'bad');
+  act(label, ()=>fn(typed.trim()), after || (async()=>{ await refreshAll(); }));
+}
+function setProfile(slot, name, from) {
+  if (from) promptDo(`"${name}" şu an ${from} (${ssidOf(from)}) yayınında. Oradan ALINSIN ve ${slot} (${ssidOf(slot)}) yayınına verilsin mi?\n${from} yayını siz yeni profil atayana kadar TÜNELSİZ kalır (killswitch tutar, istemcileri internete çıkamaz).`, `${ssidOf(slot)} / ${ssidOf(from)}`, `${slot} → ${name}`, c=>api(`/api/slot/${slot}/profile`,{method:'POST',body:{name,force:true,confirm:c}}), showSummary);
+  else promptDo(`${slot} (${ssidOf(slot)}) yayını "${name}" profiline geçsin mi?\nTünel yeniden kurulur; bu yayının istemcileri birkaç saniye internetsiz kalır (sızıntı olmaz). Handshake gelmezse eski profile dönülür.`, ssidOf(slot), `${slot} → ${name}`, c=>api(`/api/slot/${slot}/profile`,{method:'POST',body:{name,confirm:c}}), showSummary);
+}
+function rePin(slot){ promptDo(`${slot} yayınının MEVCUT durumu (SSID, profil, sunucu anahtarı, radyo MAC) sabit olarak kaydedilsin ve yayın yeniden başlatılsın mı?\nŞu an: ${ssidOf(slot)} → ${profOf(slot)}`, ssidOf(slot), `${slot} sabitle`, c=>api(`/api/slot/${slot}/pin`,{method:'POST',body:{confirm:c}}), async r=>{ await refreshStatus(); render(); toast(`Sabitlendi: ${r.msg||''}`,'ok'); }); }
+async function showSummary(r){ EXIT={}; await refreshAll(); if(r?.summary) toast(r.summary.join('\n'), 'ok'); }
+function swapSlots(a,b){ promptDo(`${a} ⇄ ${b}: iki yayının VPN profilleri yer değiştirsin mi?\n${ssidOf(a)} → ${profOf(b)}\n${ssidOf(b)} → ${profOf(a)}\nİki yayının istemcileri de kısa süre internetsiz kalır. 1-3 dakika sürebilir.`, `${ssidOf(a)} / ${ssidOf(b)}`, `${a} ⇄ ${b}`, c=>api('/api/swap',{method:'POST',body:{a,b,confirm:c}}), showSummary); }
+function toggleSlot(slot, on){ confirmDo(on?`${slot} yayını AÇILSIN mı? SSID yayına girer, tünel kurulur.`:`${slot} yayını KAPATILSIN mı? SSID kapanır, bağlı istemciler düşer, tünel kapatılır. Diğer yayın etkilenmez.`, on?`${slot} aç`:`${slot} kapat`, ()=>api(`/api/slot/${slot}/${on?'enable':'disable'}`,{method:'POST'})); }
+function exitIP(slot){ act(`çıkış IP (${slot})`, ()=>api('/api/exitip/'+slot,{method:'POST'}), r=>{ EXIT[slot]=r.exit_ip; render(); }); }
+function verifyAll(){ act('doğrulama', ()=>api('/api/verify',{method:'POST'}), r=>toast(`${r.pass} PASS / ${r.fail} FAIL` + (r.failures.length?'\n'+r.failures.join('\n'):''), r.fail?'bad':'ok')); }
+function firewall(){ act('firewall', ()=>api('/api/firewall',{method:'POST'}), r=>{ toast(r.msg,'ok'); refreshStatus(); }); }
+function reboot(){ confirmDo('Pi yeniden başlatılsın mı? Tüm yayınlar, tüneller ve Pi'deki diğer servisler ~1-2 dk kapalı kalır.', 'yeniden başlat', ()=>api('/api/reboot',{method:'POST'}), ()=>toast('Yeniden başlatılıyor… ~1 dk sonra sayfayı yenileyin.','ok')); }
+function kick(mac, slot){ confirmDo(`${mac} düşürülsün mü?`, 'düşür', ()=>api('/api/kick',{method:'POST',body:{mac,slot}}), refreshClients); }
+function saveWifi(slot){ const ssid=$(`#ssid-${slot}`).value, psk=$(`#psk-${slot}`).value, cur=WIFI[slot]||{}; const b={}; if(ssid!==cur.ssid) b.ssid=ssid; if(psk!==cur.psk) b.psk=psk; if(!Object.keys(b).length) return toast('Değişiklik yok');
+  confirmDo(`${slot} Wi-Fi ayarları değişsin mi?\n${b.ssid?`SSID: ${cur.ssid} → ${b.ssid}\n`:''}${b.psk?'Parola değişecek\n':''}\nBu yayına bağlı istemciler düşer ve yeni bilgilerle tekrar bağlanır.`, `Wi-Fi (${slot})`, ()=>api('/api/wifi/'+slot,{method:'POST',body:b}), async()=>{ WIFI[slot]=await api('/api/wifi/'+slot); await refreshStatus(); render(); toast('Uygulandı','ok'); }); }
+function addProfile(){ const name=$('#pname').value.trim(), conf=$('#pconf').value, ow=$('#pow').checked; if(!name||!conf) return toast('Ad ve config gerekli','bad');
+  act('profil ekle', ()=>api('/api/profiles',{method:'POST',body:{name,conf,overwrite:ow}}), async r=>{ $('#pname').value=''; $('#pconf').value=''; await refreshProfiles(); toast(`"${r.name}" eklendi` + (r.warnings?.length?'\n'+r.warnings.join('\n'):''), 'ok'); }); }
+function delProfile(name){ confirmDo(`"${name}" silinsin mi?`, 'profil sil', ()=>api('/api/profiles/'+encodeURIComponent(name),{method:'DELETE'}), refreshProfiles); }
+async function loadLogs(){ const r = await api('/api/logs?lines=120'); $('#logpre').textContent = r.lines.join('\n'); }
+function changePw(){ const p=prompt('Yeni web parolası (8-128 karakter):'); if(!p) return; act('parola', ()=>api('/api/password',{method:'POST',body:{password:p}}), ()=>toast('Parola değişti','ok')); }
+
+// ---------------- çizim
+function render(){
+  if (!ST) return;
+  if (tab==='slots') {
+    const s=ST; let h='';
+    for (const sl of s.slots) {
+      const healthy = sl.enabled && sl.ap.up && sl.vpn.healthy && sl.killswitch;
+      const other = s.slots.length===2 ? s.slots.find(x=>x.name!==sl.name) : null;
+      const opts = PROFILES.map(p => { const mine = p.slot===sl.name, used = p.slot && !mine; return `<option value="${esc(p.name)}" data-from="${esc(p.slot||'')}" ${mine?'selected':''}>${esc(p.name)}${mine?' (bu yayın)':used?` — ${esc(p.slot)}'den alınır`:''}</option>`; }).join('');
+      h += `<div class="card"><div class="h"><span class="dot ${healthy?'ok':sl.enabled?'warn':''}"></span><b class="mono">${esc(sl.name)}</b><span class="k">${healthy?'sağlıklı':sl.enabled?'sorun var':'kapalı'}</span><span class="sp" style="flex:1"></span>
+        <span class="k">Yayın</span><button class="switch ${sl.enabled?'on':''}" onclick="toggleSlot('${esc(sl.name)}',${!sl.enabled})" title="${sl.enabled?'Kapat':'Aç'}"><i></i></button></div>
+        <div class="slot">
+          <div class="col"><span class="k">Wi-Fi</span><span class="big">${esc(sl.ap.ssid)}</span><span class="mono k">${esc(sl.ap.band)} · kanal ${sl.ap.channel} · ${sl.ap.width_mhz ?? "?"} MHz · ${esc(sl.ap.if)}</span>
+            <span><span class="dot ${sl.ap.up?'ok':'bad'}"></span> ${sl.ap.up?'yayında':'KAPALI'} <span class="k">· ${sl.clients} istemci · ${esc(sl.net)}</span></span></div>
+          <div class="col"><span class="k">VPN çıkışı</span>
+            <div class="row"><select id="prof-${esc(sl.name)}" ${sl.enabled?'':'disabled'}><option value="">— profil seç —</option>${opts}</select>
+              <button class="btn s p" onclick="(()=>{const o=$('#prof-${esc(sl.name)}').selectedOptions[0]; if(!o||!o.value) return; if(o.dataset.from==='${esc(sl.name)}') return toast('Zaten bu profil'); setProfile('${esc(sl.name)}', o.value, o.dataset.from||null);})()" ${sl.enabled?'':'disabled'}>Uygula</button>
+              ${other?`<button class="btn s" onclick="swapSlots('${esc(sl.name)}','${esc(other.name)}')" title="İki yayının profillerini yer değiştir">⇄ ${esc(other.name)} ile takas</button>`:''}</div>
+            <span><span class="dot ${sl.vpn.healthy?'ok':'bad'}"></span> ${sl.vpn.healthy?`handshake ${fmtD(sl.vpn.handshakeAge??sl.vpn.handshake_age_s??0)} önce`:'tünel yok'} <span class="mono k">· ${esc(sl.vpn.endpoint||'-')} · ${esc(sl.vpn.if)} ${esc(sl.vpn.address||'')}</span></span>
+            <span class="k">↓${fmtB(sl.vpn.rx_bytes)} ↑${fmtB(sl.vpn.tx_bytes)}</span>
+            <div class="row"><span class="k">Çıkış IP:</span><b class="mono">${esc(EXIT[sl.name]||'—')}</b><button class="btn s" onclick="exitIP('${esc(sl.name)}')" ${sl.vpn.up?'':'disabled'}>Sorgula</button></div></div>
+          <div class="col" style="align-items:flex-end"><span class="tag ${sl.killswitch?'ok':'bad'}">${sl.killswitch?'✓ killswitch':'✗ killswitch YOK'}</span>
+            <span class="tag ${sl.pin?.ok?'ok':'bad'}" title="${esc(sl.pin?.msg||'')}">${sl.pin?.ok?(sl.pin.pinned?`🔒 sabit: ${esc(sl.pin.profile)}`:'sabit yok (profil atanmamış)'):'⚠ SABİT İHLALİ'}</span></div>
+        </div>
+        ${sl.pin && !sl.pin.ok ? `<div class="viol"><b>ATAMA İHLALİ — yayın durduruldu (fail-closed).</b> ${esc(sl.pin.violation||sl.pin.msg)}<br><span class="k">Bu değişikliği siz yapmadıysanız önce araştırın. Mevcut durum doğruysa:</span> <button class="btn s" onclick="rePin('${esc(sl.name)}')">Yeniden sabitle</button></div>` : ''}
+        </div>`;
+    }
+    const svc = Object.entries(s.services||{}).map(([k,v])=>`<span class="tag ${v?'ok':'bad'} mono">${esc(k)}</span>`).join(' ');
+    h += `<div class="card"><div class="h"><span class="dot ${Object.values(s.services||{}).every(Boolean)?'ok':'bad'}"></span><b>Pi</b></div>
+      <div class="row" style="gap:22px"><span><span class="k">LAN</span><br><span class="mono">${esc(s.lan.if)} ${esc(s.lan.ip)}</span></span><span><span class="k">Gateway</span><br><span class="mono">${esc(s.lan.gw)}</span></span><span><span class="k">Çalışma</span><br>${fmtD(s.uptime_s)}</span><span><span class="k">Yük</span><br>${s.load1}</span><span><span class="k">Sıcaklık</span><br>${s.temp_c!=null?s.temp_c.toFixed(1)+'°C':'-'}</span><span style="flex:1"></span>${svc}</div></div>
+      <div class="row"><button class="btn" onclick="refreshAll()">Yenile</button><button class="btn" onclick="verifyAll()">Tam doğrulama</button><button class="btn" onclick="firewall()">Firewall'ı yeniden uygula</button><button class="btn" onclick="changePw()">Web parolası</button><span style="flex:1"></span><button class="btn d" onclick="reboot()">Yeniden başlat</button></div>`;
+    $('#t-slots').innerHTML = h;
+  }
+  if (tab==='clients') {
+    $('#t-clients').innerHTML = `<div class="card"><div class="h"><b>Bağlı istemciler</b><span class="k">${CLIENTS.length}</span><span style="flex:1"></span><button class="btn s" onclick="refreshClients()">Yenile</button></div>` +
+      (CLIENTS.length? `<table><tr><th>Yayın</th><th>Cihaz</th><th>IP</th><th>MAC</th><th>Sinyal</th><th>Hız</th><th>Süre</th><th>Trafik</th><th></th></tr>` +
+      CLIENTS.map(c=>`<tr><td class="mono">${esc(c.slot)}</td><td>${esc(c.hostname||'—')}</td><td class="mono">${esc(c.ip||'—')}</td><td class="mono">${esc(c.mac)}</td><td style="color:${(c.signal_dbm??-100)>-65?'var(--ok)':'var(--warn)'}">${c.signal_dbm??'—'} dBm</td><td>${c.tx_rate_mbps?Math.round(c.tx_rate_mbps)+' Mbps':'—'}</td><td>${c.connected_s!=null?fmtD(c.connected_s):'—'}</td><td class="k">↓${fmtB(c.tx_bytes)} ↑${fmtB(c.rx_bytes)}</td><td><button class="btn s" onclick="kick('${esc(c.mac)}','${esc(c.slot)}')">Düşür</button></td></tr>`).join('') + '</table>'
+      : '<p class="k">Şu an bağlı istemci yok.</p>') + '</div>';
+  }
+  if (tab==='wifi') {
+    $('#t-wifi').innerHTML = ST.slots.map(sl => { const w = WIFI[sl.name]||{}; return `<div class="card"><div class="h"><b class="mono">${esc(sl.name)}</b><span class="k">${esc(w.band||sl.ap.band)} · kanal ${w.channel??sl.ap.channel} · ${esc(w.if||sl.ap.iface)} · VPN: ${esc(sl.vpn.profile||'—')}</span></div>
+      <div class="col" style="max-width:520px"><label class="k">Ağ adı (SSID)</label><input type="text" id="ssid-${esc(sl.name)}" value="${esc(w.ssid??'')}" maxlength="32">
+      <label class="k">Parola</label><div class="row"><input type="password" id="psk-${esc(sl.name)}" value="${esc(w.psk??'')}" style="flex:1" class="mono"><button class="btn s" onclick="(i=>i.type=i.type==='password'?'text':'password')($('#psk-${esc(sl.name)}'))">Göster/gizle</button><button class="btn s" onclick="navigator.clipboard.writeText($('#psk-${esc(sl.name)}').value);toast('Kopyalandı')">Kopyala</button></div>
+      <p class="k">SSID'nin <span class="mono">_nomap</span> ile bitmesi önerilir (konum veritabanına kayıt engellenir). Uygulanınca yalnızca bu yayının istemcileri düşer.</p>
+      <div class="row"><button class="btn p" onclick="saveWifi('${esc(sl.name)}')">Uygula</button><button class="btn" onclick="refreshWifiAll()">Vazgeç</button></div></div></div>`; }).join('');
+  }
+  if (tab==='vpn') {
+    $('#t-vpn').innerHTML = `<div class="card"><div class="h"><b>Profiller</b><span class="k">${PROFILES.length} · her profil en fazla bir yayında</span></div>` +
+      (PROFILES.length ? `<table><tr><th>Ad</th><th>Uç nokta</th><th>Adres</th><th>MTU</th><th>Yayın</th><th></th></tr>` + PROFILES.map(p=>`<tr><td><b>${esc(p.name)}</b> <span class="tag">${esc(p.type)}</span></td><td class="mono">${esc(p.endpoint||'-')}</td><td class="mono">${esc(p.address||'-')}</td><td>${esc(p.mtu||'-')}</td><td>${p.slot?`<span class="tag ok mono">→ ${esc(p.slot)}</span>`:'<span class="k">boşta</span>'}</td><td>${p.slot?'':`<button class="btn s d" onclick="delProfile('${esc(p.name)}')">Sil</button>`}</td></tr>`).join('') + '</table>' : '<p class="k">Profil yok</p>') +
+      `</div><div class="card"><div class="h"><b>Yeni profil (WireGuard .conf)</b></div><div class="col"><div class="row"><input type="text" id="pname" placeholder="Profil adı (harf/rakam/-/_)" maxlength="32"><label class="k"><input type="checkbox" id="pow"> üzerine yaz</label><input type="file" id="pfile" accept=".conf,text/plain" style="font-size:12px"></div>
+      <textarea id="pconf" placeholder="[Interface]&#10;PrivateKey = …&#10;Address = …&#10;&#10;[Peer]&#10;PublicKey = …&#10;Endpoint = host:port&#10;AllowedIPs = 0.0.0.0/0"></textarea>
+      <p class="k">Pi tarafında config temizlenir (DNS/Table/PostUp atılır, Table = off zorlanır) ve kernel ile doğrulanır. Yayına atandığında 40 sn içinde handshake gelmezse eski profile dönülür.</p>
+      <div class="row"><button class="btn p" onclick="addProfile()">Pi'ye gönder</button></div></div></div>`;
+    const f = $('#pfile'); if (f) f.onchange = async () => { const fl=f.files[0]; if(!fl) return; $('#pconf').value = await fl.text(); if(!$('#pname').value) $('#pname').value = fl.name.replace(/\.conf$/i,'').replace(/[^A-Za-z0-9_-]/g,'-'); };
+  }
+  if (tab==='logs') { if(!$('#logpre')) { $('#t-logs').innerHTML = `<div class="card"><div class="h"><b>Pi günlüğü</b><span style="flex:1"></span><button class="btn s" onclick="loadLogs()">Yenile</button></div><pre class="log" id="logpre">…</pre></div>`; loadLogs(); } }
+}
+
+// ---------------- başlangıç
+(async () => { try { const me = await api('/api/me'); $('#title').textContent = (me.name||'PiAP') + ' Yönetim'; if (me.authed) { showApp(); await refreshAll(); } else showLogin(); } catch(e) { showLogin(); } })();
+</script>
+</body>
+</html>
