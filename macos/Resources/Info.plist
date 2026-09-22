@@ -16,6 +16,6 @@
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSBluetoothAlwaysUsageDescription</key>
-  <string>PiAP Manager, Raspberry Pi üzerindeki VPN erişim noktasını Bluetooth üzerinden yönetmek için Bluetooth kullanır.</string>
+  <string>PiAP Manager uses Bluetooth to manage the VPN access point running on your Raspberry Pi.</string>
 </dict>
 </plist>

@@ -2,12 +2,12 @@ import Foundation
 import CoreBluetooth
 import CryptoKit
 
-/// Pi tarafındaki ap-ble-agent (protokol v2) ile konuşan BLE istemcisi.
+/// BLE client that talks to ap-ble-agent (protocol v2) on the Pi.
 ///
-/// Çerçeve: her yazım/bildirimin ilk baytı başlık — bit7 = FIN, bit0-6 = sıra no.
-/// El sıkışma (düz metin): hello{nonce_c} → challenge{nonce_s, proof_s} → auth{proof_c} → ok.
-/// Sonrası: her mesaj counter(8B BE) || ChaCha20-Poly1305(K, nonce = dir(4B)||counter, JSON).
-/// K = HKDF-SHA256(token, salt = nonce_c||nonce_s, info "piap-ble-v2"). Dinleyen bir abone sadece şifreli metin görür.
+/// Framing: the first byte of every write/notification is a header — bit7 = FIN, bits0-6 = sequence.
+/// Handshake (plaintext): hello{nonce_c} → challenge{nonce_s, proof_s} → auth{proof_c} → ok.
+/// Afterwards: every message is counter(8B BE) || ChaCha20-Poly1305(K, nonce = dir(4B)||counter, JSON).
+/// K = HKDF-SHA256(token, salt = nonce_c||nonce_s, info "piap-ble-v2"). A listening subscriber sees ciphertext only.
 final class BLEClient: NSObject, ObservableObject {
     static let serviceUUID = CBUUID(string: "7f2a0001-9c1e-4b7a-8d3e-5a6b7c8d9e0f")
     static let rxUUID      = CBUUID(string: "7f2a0002-9c1e-4b7a-8d3e-5a6b7c8d9e0f")
@@ -18,16 +18,16 @@ final class BLEClient: NSObject, ObservableObject {
         case starting, off, idle, scanning, connecting, discovering, pairing, authenticating, ready, error(String)
         var label: String {
             switch self {
-            case .starting: return "Bluetooth hazırlanıyor…"
-            case .off: return "Bluetooth kapalı"
-            case .idle: return "Bağlı değil"
-            case .scanning: return "Taranıyor…"
-            case .connecting: return "Bağlanıyor…"
-            case .discovering: return "Servisler keşfediliyor…"
-            case .pairing: return "Eşleştiriliyor…"
-            case .authenticating: return "Kimlik doğrulanıyor…"
-            case .ready: return "Bağlı (şifreli)"
-            case .error(let e): return "Hata: \(e)"
+            case .starting: return "Preparing Bluetooth…"
+            case .off: return "Bluetooth is off"
+            case .idle: return "Not connected"
+            case .scanning: return "Scanning…"
+            case .connecting: return "Connecting…"
+            case .discovering: return "Discovering services…"
+            case .pairing: return "Pairing…"
+            case .authenticating: return "Authenticating…"
+            case .ready: return "Connected (encrypted)"
+            case .error(let e): return "Error: \(e)"
             }
         }
     }
@@ -61,7 +61,7 @@ final class BLEClient: NSObject, ObservableObject {
     private var writing = false
     private var handshakeCont: CheckedContinuation<[String: Any], Error>?
     private var handshakeTimer: DispatchWorkItem?
-    // oturum anahtarı ve sayaçlar
+    // session key and counters
     private var sessionKey: SymmetricKey?
     private var c2pNext: UInt64 = 0
     private var p2cLast: Int64 = -1
@@ -75,7 +75,7 @@ final class BLEClient: NSObject, ObservableObject {
         logFile = try? FileHandle(forWritingTo: url); logFile?.seekToEndOfFile()
         super.init()
         central = CBCentralManager(delegate: self, queue: .main)
-        note("başlatıldı (proto v\(Self.protoVersion))")
+        note("started (proto v\(Self.protoVersion))")
     }
 
     func note(_ s: String) {
@@ -85,27 +85,27 @@ final class BLEClient: NSObject, ObservableObject {
         logFile?.write((line + "\n").data(using: .utf8)!)
     }
 
-    // MARK: - tarama / bağlantı
+    // MARK: - scanning / connecting
     func startScan() {
         guard central.state == .poweredOn else { if state != .starting { state = .off }; return }
         found = []; state = .scanning
         central.scanForPeripherals(withServices: [Self.serviceUUID], options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
-        note("tarama başladı")
+        note("scan started")
     }
 
     func stopScan() { central.stopScan(); if state == .scanning { state = .idle } }
 
     func connect(_ id: UUID) {
-        guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else { state = .error("cihaz bulunamadı"); return }
+        guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else { state = .error("device not found"); return }
         central.stopScan()
         peripheral = p; p.delegate = self; peripheralName = p.name ?? "PiAP"; connectedID = id
         state = .connecting; central.connect(p, options: nil)
-        note("bağlanılıyor: \(peripheralName) \(id)")
+        note("connecting: \(peripheralName) \(id)")
     }
 
     func disconnect() {
         if let p = peripheral { central.cancelPeripheralConnection(p) }
-        cleanup(reason: "kullanıcı")
+        cleanup(reason: "user")
     }
 
     private func cleanup(reason: String) {
@@ -116,7 +116,7 @@ final class BLEClient: NSObject, ObservableObject {
         writeQueue.removeAll(); writing = false; inBuf = Data(); inSeq = 0; rxSeq = 0
         sessionKey = nil; c2pNext = 0; p2cLast = -1
         rx = nil; tx = nil; peripheral = nil; connectedID = nil
-        if state != .idle { note("bağlantı kapandı (\(reason))") }
+        if state != .idle { note("connection closed (\(reason))") }
         state = .idle
         onDisconnect?()
     }
@@ -126,13 +126,13 @@ final class BLEClient: NSObject, ObservableObject {
         case notReady, disconnected, timeout, remote(String), auth(String), badResponse, crypto
         var errorDescription: String? {
             switch self {
-            case .notReady: return "bağlı değil"
-            case .disconnected: return "bağlantı koptu"
-            case .timeout: return "zaman aşımı"
+            case .notReady: return "not connected"
+            case .disconnected: return "connection lost"
+            case .timeout: return "timed out"
             case .remote(let m): return m
-            case .auth(let m): return "kimlik doğrulama: \(m)"
-            case .badResponse: return "geçersiz cevap"
-            case .crypto: return "şifreleme hatası"
+            case .auth(let m): return "authentication: \(m)"
+            case .badResponse: return "invalid response"
+            case .crypto: return "encryption error"
             }
         }
     }
@@ -147,16 +147,16 @@ final class BLEClient: NSObject, ObservableObject {
             pending[id] = cont
             let w = DispatchWorkItem { [weak self] in
                 guard let self, let c = self.pending.removeValue(forKey: id) else { return }
-                self.note("id=\(id) \(op): zaman aşımı"); c.resume(throwing: BLEError.timeout)
+                self.note("id=\(id) \(op): timed out"); c.resume(throwing: BLEError.timeout)
             }
             pendingTimers[id] = w
             DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: w)
             do { try sendSealed(msg) } catch { pending.removeValue(forKey: id); w.cancel(); cont.resume(throwing: error) }
         }
         if let ok = resp["ok"] as? Bool, ok { return resp["result"] ?? [:] }
-        let err = (resp["error"] as? String) ?? "bilinmeyen hata"
-        if err.contains("oturum gecersiz") || err.contains("yetkisiz") { // Pi tarafı oturumu düşürdü → yeniden el sıkış
-            note("oturum düştü, yeniden kimlik doğrulanıyor"); Task { await authenticate() }
+        let err = (resp["error"] as? String) ?? "unknown error"
+        if err.contains("session invalid") || err.contains("unauthorized") { // the Pi dropped the session → handshake again
+            note("session dropped, re-authenticating"); Task { await authenticate() }
         }
         throw BLEError.remote(err)
     }
@@ -168,7 +168,7 @@ final class BLEClient: NSObject, ObservableObject {
         (try await call(op, args: args, timeout: timeout) as? [[String: Any]]) ?? []
     }
 
-    // MARK: - el sıkışma (v2)
+    // MARK: - handshake (v2)
     private func hmacHex(_ msg: String) -> String {
         let mac = HMAC<SHA256>.authenticationCode(for: Data(msg.utf8), using: SymmetricKey(data: Data(token.utf8)))
         return mac.map { String(format: "%02x", $0) }.joined()
@@ -194,27 +194,27 @@ final class BLEClient: NSObject, ObservableObject {
         do {
             let ch = try await handshakeStep(["op": "hello", "v": Self.protoVersion, "nonce": nc, "id": 0])
             guard ch["op"] as? String == "challenge", let ns = ch["nonce"] as? String, let proofS = ch["proof"] as? String else {
-                let e = (ch["error"] as? String) ?? "beklenmeyen cevap"; state = .error(e); note("hello: \(e)"); return
+                let e = (ch["error"] as? String) ?? "unexpected response"; state = .error(e); note("hello: \(e)"); return
             }
-            // Pi'nin token'ı bildiğini doğrula (sahte "PiAP" peripheral'ı burada elenir)
-            guard proofS == hmacHex("srv|\(nc)|\(ns)") else { state = .error("cihaz kimliği doğrulanamadı (sahte PiAP?)"); note("SUNUCU KANITI YANLIŞ"); disconnect(); return }
-            note("← challenge OK (cihaz kanıtı doğru, \(ch["name"] ?? "?"))")
+            // Verify that the Pi knows the token (a fake "PiAP" peripheral is rejected here)
+            guard proofS == hmacHex("srv|\(nc)|\(ns)") else { state = .error("device identity could not be verified (fake PiAP?)"); note("SERVER PROOF WRONG"); disconnect(); return }
+            note("← challenge OK (server proof valid, \(ch["name"] ?? "?"))")
             let ok = try await handshakeStep(["op": "auth", "proof": hmacHex("cli|\(nc)|\(ns)"), "id": 0])
             guard ok["ok"] as? Bool == true else {
                 let e = (ok["error"] as? String) ?? "reddedildi"; note("← auth RED: \(e)")
-                state = .error(e.contains("kimlik") ? "token reddedildi" : e); disconnect(); return
+                state = .error(e.contains("authentication") ? "token rejected" : e); disconnect(); return
             }
-            // oturum anahtarı
+            // session key
             let salt = Data(hex: nc)! + Data(hex: ns)!
             sessionKey = HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: Data(token.utf8)), salt: salt, info: Data("piap-ble-v2".utf8), outputByteCount: 32)
             c2pNext = 0; p2cLast = -1
-            state = .ready; note("hazır — şifreli oturum (MTU \(mtu))")
+            state = .ready; note("ready — encrypted session (MTU \(mtu))")
         } catch {
-            state = .error("el sıkışma: \(error.localizedDescription)"); note("el sıkışma hatası: \(error)")
+            state = .error("handshake: \(error.localizedDescription)"); note("handshake error: \(error)")
         }
     }
 
-    // MARK: - şifreleme
+    // MARK: - encryption
     private static let dirC2P = Data([0x63, 0x32, 0x70, 0x00]), dirP2C = Data([0x70, 0x32, 0x63, 0x00])
 
     private func seal(_ obj: [String: Any]) throws -> Data {
@@ -240,17 +240,17 @@ final class BLEClient: NSObject, ObservableObject {
         return obj
     }
 
-    // MARK: - çerçeveleme
+    // MARK: - framing
     private func sendPlain(_ obj: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: obj) else { return }
-        note("→ \(obj["op"] ?? "?") (düz, \(data.count)B)"); enqueue(data)
+        note("→ \(obj["op"] ?? "?") (plain, \(data.count)B)"); enqueue(data)
     }
     private func sendSealed(_ obj: [String: Any]) throws {
         let data = try seal(obj)
-        note("→ \(obj["op"] ?? "?") (şifreli, \(data.count)B)"); enqueue(data)
+        note("→ \(obj["op"] ?? "?") (encrypted, \(data.count)B)"); enqueue(data)
     }
     private func enqueue(_ data: Data) {
-        guard let p = peripheral, let rx else { note("send: rx yok"); return }
+        guard let p = peripheral, let rx else { note("send: no rx characteristic"); return }
         let chunk = max(16, min(mtu, 512) - 1)
         var i = 0
         repeat {
@@ -275,23 +275,23 @@ final class BLEClient: NSObject, ObservableObject {
         let data = inBuf; inBuf = Data()
         if sessionKey != nil, state == .ready {
             if let obj = try? open(data) { route(obj) } else {
-                // düz metin bir hata olabilir ("oturum gecersiz") — dene
-                if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] { note("← düz (oturum dışı): \(obj["error"] ?? obj)"); route(obj) }
-                else { note("← açılamayan çerçeve (\(data.count)B) — yok sayıldı") }
+                // it may be a plaintext error ("session invalid") — try that
+                if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] { note("← plain (outside the session): \(obj["error"] ?? obj)"); route(obj) }
+                else { note("← undecryptable frame (\(data.count)B) — ignored") }
             }
             return
         }
-        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { note("← geçersiz JSON"); return }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { note("← invalid JSON"); return }
         if let c = handshakeCont { handshakeCont = nil; handshakeTimer?.cancel(); c.resume(returning: obj); return }
         route(obj)
     }
 
     private func route(_ obj: [String: Any]) {
         guard let id = obj["id"] as? Int else { note("← id'siz: \(obj)"); return }
-        if obj["ack"] as? Bool == true { note("← ack id=\(id) (\(obj["op"] ?? "")) çalışıyor…"); return }
+        if obj["ack"] as? Bool == true { note("← ack id=\(id) (\(obj["op"] ?? "")) working…"); return }
         guard let cont = pending.removeValue(forKey: id) else { note("← bilinmeyen id=\(id)"); return }
         pendingTimers.removeValue(forKey: id)?.cancel()
-        note("← id=\(id) \(obj["ok"] as? Bool == true ? "ok" : "HATA: \(obj["error"] ?? "")")")
+        note("← id=\(id) \(obj["ok"] as? Bool == true ? "ok" : "ERROR: \(obj["error"] ?? "")")")
         cont.resume(returning: obj)
     }
 }
@@ -315,7 +315,7 @@ extension BLEClient: CBCentralManagerDelegate {
         note("BT durumu: \(c.state.rawValue)")
         switch c.state {
         case .poweredOn: if state == .off || state == .starting { state = .idle }
-        case .unauthorized: state = .error("Bluetooth izni verilmedi (Sistem Ayarları → Gizlilik → Bluetooth)")
+        case .unauthorized: state = .error("Bluetooth permission denied (System Settings → Privacy → Bluetooth)")
         case .unknown, .resetting: state = .starting
         default: state = .off
         }
@@ -326,10 +326,10 @@ extension BLEClient: CBCentralManagerDelegate {
         else { found.append(Found(id: p.identifier, name: name, rssi: rssi.intValue)); note("bulundu: \(name) rssi=\(rssi)") }
     }
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
-        state = .discovering; note("bağlandı, servis keşfi"); p.discoverServices([Self.serviceUUID])
+        state = .discovering; note("connected, discovering services"); p.discoverServices([Self.serviceUUID])
     }
     func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
-        state = .error("bağlanamadı: \(error?.localizedDescription ?? "?")"); cleanup(reason: "fail")
+        state = .error("could not connect: \(error?.localizedDescription ?? "?")"); cleanup(reason: "fail")
     }
     func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
         cleanup(reason: error?.localizedDescription ?? "uzak taraf")
@@ -339,7 +339,7 @@ extension BLEClient: CBCentralManagerDelegate {
 // MARK: - CBPeripheralDelegate
 extension BLEClient: CBPeripheralDelegate {
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let s = p.services?.first(where: { $0.uuid == Self.serviceUUID }) else { state = .error("PiAP servisi yok: \(error?.localizedDescription ?? "")"); return }
+        guard let s = p.services?.first(where: { $0.uuid == Self.serviceUUID }) else { state = .error("no PiAP service: \(error?.localizedDescription ?? "")"); return }
         p.discoverCharacteristics([Self.rxUUID, Self.txUUID], for: s)
     }
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor s: CBService, error: Error?) {
@@ -352,21 +352,21 @@ extension BLEClient: CBPeripheralDelegate {
         if let error {
             let ns = error as NSError
             if ns.domain == CBATTErrorDomain, ns.code == CBATTError.insufficientEncryption.rawValue || ns.code == CBATTError.insufficientAuthentication.rawValue {
-                state = .error("eşleştirme reddedildi: Pi'de eşleştirme penceresi kapalı. Pi'de `sudo ap-ctl ble pair 120` çalıştırıp tekrar deneyin.")
+                state = .error("pairing refused: the pairing window on the Pi is closed. Run `sudo ap-ctl ble pair 120` on the Pi and try again.")
             } else { state = .error("notify: \(error.localizedDescription)") }
-            note("notify hatası: \(error)"); return
+            note("notify error: \(error)"); return
         }
         guard ch.isNotifying else { return }
-        note("TX notify açık"); Task { await authenticate() }
+        note("TX notifications on"); Task { await authenticate() }
     }
     func peripheral(_ p: CBPeripheral, didWriteValueFor ch: CBCharacteristic, error: Error?) {
         writing = false
         if let error {
-            note("write hatası: \(error.localizedDescription) — kuyruk temizlendi")
+            note("write error: \(error.localizedDescription) — queue cleared")
             writeQueue.removeAll()
             let ns = error as NSError
             if ns.domain == CBATTErrorDomain, ns.code == CBATTError.insufficientEncryption.rawValue || ns.code == CBATTError.insufficientAuthentication.rawValue {
-                state = .error("şifreli yazma reddedildi: eşleştirme yok. Pi'de `sudo ap-ctl ble pair 120` sonra tekrar deneyin.")
+                state = .error("encrypted write refused: not paired. Run `sudo ap-ctl ble pair 120` on the Pi and try again.")
             }
             if let c = handshakeCont { handshakeCont = nil; handshakeTimer?.cancel(); c.resume(throwing: BLEError.remote(error.localizedDescription)) }
             return
@@ -374,7 +374,7 @@ extension BLEClient: CBPeripheralDelegate {
         if let rx { pumpWrites(p, rx) }
     }
     func peripheral(_ p: CBPeripheral, didUpdateValueFor ch: CBCharacteristic, error: Error?) {
-        if let error { note("read/notify hatası: \(error.localizedDescription)"); return }
+        if let error { note("read/notify error: \(error.localizedDescription)"); return }
         guard ch.uuid == Self.txUUID, let v = ch.value else { return }
         received(v)
     }

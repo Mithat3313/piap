@@ -3,7 +3,7 @@ import SwiftUI
 import Security
 import Combine
 
-// MARK: - Keychain (cihaz başına token)
+// MARK: - Keychain (one token per device)
 enum Keychain {
     static let service = "com.mithat.piapmanager"
     static func account(_ id: UUID) -> String { "ble-token-\(id.uuidString)" }
@@ -29,7 +29,7 @@ enum Keychain {
 // MARK: - Modeller
 struct APInfo { var iface = "", ssid = "?", up = false, channel = 0, width = 0, band = "" }
 struct VPNInfo { var iface = "", profile: String? = nil, up = false, healthy = false, endpoint = "-", handshakeAge: Int? = nil, address = "-", rx = 0, tx = 0, mtu = 0 }
-/// Atama sabiti: SSID ↔ profil ↔ sunucu anahtarı ↔ radyo MAC. Pi tarafında ap-pin.sh sapmada yayını durdurur (fail-closed).
+/// Assignment pin: SSID ↔ profile ↔ server key ↔ radio MAC. On the Pi, ap-pin.sh stops the SSID on drift (fail-closed).
 struct PinInfo { var pinned = false, profile: String? = nil, ssid: String? = nil, peer: String? = nil, mac: String? = nil, ok = true, msg = "", violation: String? = nil }
 struct Slot: Identifiable {
     let name: String; var enabled: Bool; var ap: APInfo; var vpn: VPNInfo; var net: String; var clients: Int; var killswitch: Bool; var services: [String: Bool]; var pin: PinInfo
@@ -151,11 +151,11 @@ final class AppState: ObservableObject {
 
     func run(_ label: String, _ body: @escaping () async throws -> Void) {
         Task { busy = label; lastError = nil
-            do { try await body() } catch { lastError = error.localizedDescription; ble.note("HATA \(label): \(error.localizedDescription)") }
+            do { try await body() } catch { lastError = error.localizedDescription; ble.note("ERROR \(label): \(error.localizedDescription)") }
             busy = nil }
     }
 
-    // MARK: veri çekme
+    // MARK: fetching
     func refreshStatus() async {
         guard connected else { return }
         do { status = Status(try await ble.callDict("status")) } catch { lastError = error.localizedDescription }
@@ -183,11 +183,11 @@ final class AppState: ObservableObject {
 
     // MARK: eylemler
     func fetchExitIP(_ slot: String) {
-        run("Çıkış IP (\(slot))") { self.exitIP[slot] = (try await self.ble.callDict("exitip", args: ["slot": slot], timeout: 30))["exit_ip"] as? String ?? "?" }
+        run("Exit IP (\(slot))") { self.exitIP[slot] = (try await self.ble.callDict("exitip", args: ["slot": slot], timeout: 30))["exit_ip"] as? String ?? "?" }
     }
-    func kick(_ c: Client) { run("Düşür") { _ = try await self.ble.call("kick", args: ["mac": c.mac, "slot": c.slot]); await self.refreshClients() } }
+    func kick(_ c: Client) { run("Kick") { _ = try await self.ble.call("kick", args: ["mac": c.mac, "slot": c.slot]); await self.refreshClients() } }
     func setWifi(slot: String, ssid: String, psk: String) {
-        run("Wi-Fi uygula (\(slot))") {
+        run("Apply Wi-Fi (\(slot))") {
             let cur = self.wifi[slot] ?? WifiInfo(); var a: [String: Any] = ["slot": slot]
             if ssid != cur.ssid { a["ssid"] = ssid }; if psk != cur.psk { a["psk"] = psk }
             guard a.count > 1 else { return }
@@ -195,9 +195,9 @@ final class AppState: ObservableObject {
         }
     }
     func addProfile(name: String, conf: String, overwrite: Bool) {
-        run("Profil ekle") { _ = try await self.ble.call("vpn.add", args: ["name": name, "conf": conf, "overwrite": overwrite], timeout: 90); await self.refreshProfiles() }
+        run("Add profile") { _ = try await self.ble.call("vpn.add", args: ["name": name, "conf": conf, "overwrite": overwrite], timeout: 90); await self.refreshProfiles() }
     }
-    /// Yayın–VPN eşlemesini değiştiren işlemler için Pi'nin beklediği yazılı onay: etkilenen yayınların SSID'leri " / " ile.
+    /// The typed confirmation the Pi expects for operations that change the SSID-VPN mapping: the affected SSIDs joined with " / ".
     func ssid(of slot: String) -> String { status.slots.first { $0.name == slot }?.ap.ssid ?? slot }
     func confirmText(_ slots: [String]) -> String { slots.map(ssid(of:)).joined(separator: " / ") }
 
@@ -208,38 +208,38 @@ final class AppState: ObservableObject {
             await self.refreshProfiles(); await self.refreshStatus(); self.exitIP = [:]
         }
     }
-    /// İki yayının tünellerini takas et (Pi sırayla: B'yi kopar → A'ya B'nin profili → B'ye A'nın profili).
+    /// Swap the tunnels of two SSIDs (on the Pi, in order: detach B → give A the profile of B → give B the profile of A).
     func swapSlots(_ a: String, _ b: String, confirm: String) {
-        run("\(a) ⇄ \(b) takas") {
+        run("\(a) ⇄ \(b) swap") {
             let r = try await self.ble.callDict("vpn.swap", args: ["slot_a": a, "slot_b": b, "confirm": confirm], timeout: 400)
             self.verifyResult = (r["summary"] as? [String])?.joined(separator: "\n")
             await self.refreshProfiles(); await self.refreshStatus(); self.exitIP = [:]
         }
     }
-    /// Slotun MEVCUT durumunu sabit olarak kaydet (ihlal sonrası, durum doğrulandıysa) ve yayını başlat.
+    /// Pin the slot's CURRENT state (after a violation, once the state has been verified) and start the SSID.
     func pinSlot(_ slot: String, confirm: String) {
-        run("\(slot) sabitle") {
+        run("Pin \(slot)") {
             let r = try await self.ble.callDict("slot.pin", args: ["slot": slot, "confirm": confirm], timeout: 60)
             self.verifyResult = "Sabitlendi: \(r["msg"] as? String ?? "")"
             await self.refreshStatus()
         }
     }
-    func removeProfile(_ name: String) { run("Profil sil") { _ = try await self.ble.call("vpn.remove", args: ["name": name]); await self.refreshProfiles() } }
+    func removeProfile(_ name: String) { run("Delete profile") { _ = try await self.ble.call("vpn.remove", args: ["name": name]); await self.refreshProfiles() } }
     func setSlotEnabled(_ slot: String, _ on: Bool) {
-        run(on ? "\(slot) yayını aç" : "\(slot) yayını kapat") {
+        run(on ? "Turn \(slot) on" : "Turn \(slot) off") {
             _ = try await self.ble.call(on ? "slot.enable" : "slot.disable", args: ["slot": slot], timeout: 90); await self.refreshStatus()
         }
     }
     func verify() {
-        run("Doğrulama") {
+        run("Verification") {
             let r = try await self.ble.callDict("verify", timeout: 200)
             let fails = (r["failures"] as? [String]) ?? []
             self.verifyResult = "\(r["pass"] ?? "?") PASS / \(r["fail"] ?? "?") FAIL" + (fails.isEmpty ? "" : "\n" + fails.joined(separator: "\n"))
         }
     }
-    func fetchLogs(lines: Int = 80) { run("Günlük") { self.piLogs = (try await self.ble.callDict("logs", args: ["lines": lines]))["lines"] as? [String] ?? [] } }
+    func fetchLogs(lines: Int = 80) { run("Log") { self.piLogs = (try await self.ble.callDict("logs", args: ["lines": lines]))["lines"] as? [String] ?? [] } }
     func firewall() { run("Firewall") { _ = try await self.ble.call("firewall", timeout: 60); await self.refreshStatus() } }
-    func reboot() { run("Yeniden başlat") { _ = try await self.ble.call("reboot"); self.ble.disconnect() } }
+    func reboot() { run("Reboot") { _ = try await self.ble.call("reboot"); self.ble.disconnect() } }
 }
 
 func fmtBytes(_ b: Int) -> String {

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-apctl v2 — Pi5 VPN-AP kontrol katmani (COKLU SLOT).
-Slot = bir radyo + bir alt ag + bir WireGuard tuneli. /etc/ap-vpn/slots/<slot>.env
-Kutuphane (ap-ble-agent import eder) + CLI (/opt/ap-vpn/bin/ap-ctl). Root gerektirir.
+apctl — control layer for the Pi VPN-AP (multi-slot).
+A slot = one radio + one subnet + one WireGuard tunnel, defined in /etc/ap-vpn/slots/<slot>.env
+Library (imported by ap-ble-agent and ap-web) + CLI (/opt/ap-vpn/bin/ap-ctl). Requires root.
 """
 import json, os, re, subprocess, sys, time, secrets, tempfile, shutil, fcntl, contextlib, hashlib, hmac
 
@@ -28,17 +28,17 @@ LONG_LOCK_FILE = '/run/ap-vpn/long.lock'
 
 
 @contextlib.contextmanager
-def long_op(label='islem'):
-    """Surecler arasi (BLE ajani + web) uzun islem kilidi. Mesgulse hemen hata."""
+def long_op(label='operation'):
+    """Cross-process lock for long operations (BLE agent + web panel). Fails fast when busy."""
     os.makedirs(os.path.dirname(LONG_LOCK_FILE), exist_ok=True)
     fd = os.open(LONG_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        for _i in range(15):   # ap-pin enforce kilidi <1 sn tutar: kisa bekle, sonra hata
+        for _i in range(15):   # ap-pin enforce holds the lock for <1 s: wait briefly, then fail
             try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB); break
             except BlockingIOError:
                 if _i == 14:
                     who = os.read(fd, 200).decode(errors='ignore').strip()
-                    raise ApError(f'baska bir uzun islem suruyor ({who or "?"}), bekleyin')
+                    raise ApError(f'another long operation is running ({who or "?"}), please wait')
                 time.sleep(0.2)
         os.ftruncate(fd, 0); os.lseek(fd, 0, 0); os.write(fd, f'{label} pid={os.getpid()} t={int(time.time())}'.encode())
         yield
@@ -48,7 +48,7 @@ def long_op(label='islem'):
         os.close(fd)
 
 
-# ----------------------------------------------------------------- yardimcilar
+# ----------------------------------------------------------------- helpers
 def _parse_env(path):
     d = {}
     try:
@@ -77,7 +77,7 @@ def _set_env_key(path, key, value):
 
 
 def slots():
-    """Slot adi -> env dict (dosya sirasina gore)."""
+    """Slot name -> env dict (in file order)."""
     out = {}
     if not os.path.isdir(SLOTS_DIR): return out
     for fn in sorted(os.listdir(SLOTS_DIR)):
@@ -92,11 +92,11 @@ def slots():
 def _slot(name):
     if not name:
         s = slots()
-        if not s: raise ApError('hic slot yok')
+        if not s: raise ApError('no slots configured')
         return next(iter(s.values()))
-    if not _NAME.match(name): raise ApError('gecersiz slot adi')
+    if not _NAME.match(name): raise ApError('invalid slot name')
     s = slots().get(name)
-    if not s: raise ApError(f'slot yok: {name}')
+    if not s: raise ApError(f'no such slot: {name}')
     return s
 
 
@@ -111,7 +111,7 @@ def _run(cmd, timeout=30, input_text=None):
 
 
 def _run_detached(cmd, timeout):
-    """Uzun ayricalikli isi ajanin cgroup'undan AYIR: ajan yeniden baslasa da is tamamlanir."""
+    """Run a long privileged job OUTSIDE the agent's cgroup, so it completes even if the agent restarts."""
     unit = 'ap-job-' + secrets.token_hex(4)
     return _run([SYSTEMD_RUN, '--wait', '--pipe', '--collect', '--quiet', '--unit=' + unit,
                  '-p', 'KillMode=none', *cmd], timeout)
@@ -146,7 +146,7 @@ def _read_kv(path):
 def _hostapd_path(slot): return f'/etc/hostapd/{slot["SLOT"]}.conf'
 
 
-# ----------------------------------------------------------------- durum
+# ----------------------------------------------------------------- status
 def _ap_info(slot):
     h = _read_kv(_hostapd_path(slot)); ap_if = slot['AP_IF']
     out = _run([IW, 'dev', ap_if, 'info'], 5)[1]
@@ -202,10 +202,10 @@ def status():
             'clients': sum(x['clients'] for x in sl), 'uptime_s': up, 'load1': load, 'temp_c': temp,
             'killswitch': {'ok': all(x['killswitch']['ok'] for x in sl if x['enabled'])},
             'pin': {'ok': all(x['pin']['ok'] for x in sl if x['enabled'])}, 'ts': int(time.time()),
-            'ap': sl[0]['ap'] if sl else {}, 'vpn': sl[0]['vpn'] if sl else {}}   # geriye uyumluluk
+            'ap': sl[0]['ap'] if sl else {}, 'vpn': sl[0]['vpn'] if sl else {}}   # backwards compatibility
 
 
-# ----------------------------------------------------------------- istemciler
+# ----------------------------------------------------------------- clients
 def _leases(path):
     d = {}
     try:
@@ -244,12 +244,12 @@ def clients(slot=None):
 
 
 def kick(mac, slot=None):
-    if not re.match(r'\A[0-9a-fA-F:]{17}\Z', mac or ''): raise ApError('gecersiz MAC')
+    if not re.match(r'\A[0-9a-fA-F:]{17}\Z', mac or ''): raise ApError('invalid MAC address')
     targets = [_slot(slot)] if slot else list(slots().values())
     for s in targets:
         rc, out, err = _run(['/usr/sbin/hostapd_cli', '-i', s['AP_IF'], 'deauthenticate', mac], 5)
         if rc == 0 and 'OK' in out: return {'kicked': mac.lower(), 'slot': s['SLOT']}
-    raise ApError('istemci bulunamadi')
+    raise ApError('client not found')
 
 
 # ----------------------------------------------------------------- wifi
@@ -260,38 +260,50 @@ def wifi_get(slot=None):
 
 
 def _validate_ssid(ssid):
-    if not isinstance(ssid, str) or not (1 <= len(ssid.encode('utf-8')) <= 32): raise ApError('SSID 1-32 bayt olmali')
-    if any(ch in ssid for ch in '\r\n\0'): raise ApError('SSID gecersiz karakter iceriyor')
+    if not isinstance(ssid, str) or not (1 <= len(ssid.encode('utf-8')) <= 32): raise ApError('the SSID must be 1-32 bytes')
+    if any(ch in ssid for ch in '\r\n\0'): raise ApError('the SSID contains an invalid character')
 
 
 def _validate_psk(psk):
-    if not isinstance(psk, str) or not (8 <= len(psk) <= 63): raise ApError('parola 8-63 karakter olmali')
-    if not all(32 <= ord(c) <= 126 for c in psk): raise ApError('parola sadece yazdirilabilir ASCII olabilir')
+    if not isinstance(psk, str) or not (8 <= len(psk) <= 63): raise ApError('the password must be 8-63 characters')
+    if not all(32 <= ord(c) <= 126 for c in psk): raise ApError('the password must be printable ASCII')
+
+
+def _restart_hostapd(slot_env, timeout=30):
+    """stop + reset-failed + start instead of a plain restart: when ExecStartPre fails, the unit
+    enters an unthrottled auto-restart loop and a queued 'restart' job can block until it times out."""
+    unit = slot_env['HOSTAPD_UNIT']
+    _run([SYSCTL, 'stop', unit], timeout); _run([SYSCTL, 'reset-failed', unit], 5)
+    return _run([SYSCTL, 'start', unit], timeout)
 
 
 def _wifi_set_impl(slot=None, ssid=None, psk=None):
     s = _slot(slot); path = _hostapd_path(s)
-    if ssid is None and psk is None: raise ApError('ssid veya psk gerekli')
+    if ssid is None and psk is None: raise ApError('ssid or psk is required')
     if ssid is not None: _validate_ssid(ssid)
     if psk is not None: _validate_psk(psk)
     src = open(path).read(); new = src
-    # re.sub'da DEGISTIRME SABLONU degil lambda: PSK icindeki '\\' veya '\\1' yorumlanmasin
+    # A lambda, not a replacement template: a '\\' or '\\1' inside the PSK must not be interpreted.
     if ssid is not None: new = re.sub(r'^ssid=.*$', lambda m: 'ssid=' + ssid, new, count=1, flags=re.M)
     if psk is not None: new = re.sub(r'^wpa_passphrase=.*$', lambda m: 'wpa_passphrase=' + psk, new, count=1, flags=re.M)
     if new == src: return wifi_get(s['SLOT'])
+    env_path = os.path.join(SLOTS_DIR, s['SLOT'] + '.env'); old_pin = s.get('PIN_SSID_HEX') or ''
     bak = path + '.bak'; shutil.copy2(path, bak)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path)); os.write(fd, new.encode()); os.close(fd)
     os.chmod(tmp, 0o600); os.replace(tmp, path)
-    rc, _, err = _run([SYSCTL, 'restart', s['HOSTAPD_UNIT']], 30); time.sleep(3)
+    # The pin has to be updated BEFORE the restart: ap-hostapd@ runs 'ap-pin.sh check' as ExecStartPre,
+    # and a pin still holding the old SSID would refuse the new one (the SSID would never come up).
+    if ssid is not None and old_pin: _set_env_key(env_path, 'PIN_SSID_HEX', ssid.encode().hex())
+    rc, _, err = _restart_hostapd(s); time.sleep(3)
     if rc != 0 or not _active(s['HOSTAPD_UNIT']):
-        shutil.copy2(bak, path); _run([SYSCTL, 'restart', s['HOSTAPD_UNIT']], 30)
-        raise ApError(f'hostapd yeni ayarla baslamadi, geri alindi: {err.strip()[:200]}')
-    if ssid is not None and s.get('PIN_PROFILE'):   # SSID degisti: sabitteki SSID'yi de guncelle (onayli islem)
-        _set_env_key(os.path.join(SLOTS_DIR, s['SLOT'] + '.env'), 'PIN_SSID_HEX', _ssid_of(s).encode().hex())
+        shutil.copy2(bak, path)
+        if ssid is not None and old_pin: _set_env_key(env_path, 'PIN_SSID_HEX', old_pin)
+        _restart_hostapd(s)
+        raise ApError(f'hostapd did not start with the new settings, rolled back: {err.strip()[:200]}')
     return wifi_get(s['SLOT'])
 
 
-# ----------------------------------------------------------------- vpn profilleri
+# ----------------------------------------------------------------- vpn profiles
 def _parse_conf(text):
     def g(section, key):
         m = re.search(rf'^\[{section}\](.*?)(?=^\[|\Z)', text, re.S | re.M)
@@ -316,34 +328,34 @@ def vpn_list():
 
 
 def _vpn_add_impl(name, conf_text, overwrite=False):
-    if not _NAME.match(name or ''): raise ApError('profil adi: harf/rakam/-/_ , 1-32 karakter')
-    if not isinstance(conf_text, str) or len(conf_text) > 8192: raise ApError('config metni gecersiz veya cok buyuk')
+    if not _NAME.match(name or ''): raise ApError('profile name: letters/digits/-/_ , 1-32 characters')
+    if not isinstance(conf_text, str) or len(conf_text) > 8192: raise ApError('the config text is invalid or too large')
     os.makedirs(PROFILES, mode=0o700, exist_ok=True); dst = os.path.join(PROFILES, name + '.conf')
-    if os.path.exists(dst) and not overwrite: raise ApError(f'"{name}" zaten var (overwrite=true ile ez)')
-    if name in _profile_users() and overwrite: raise ApError('kullanimdaki profil ezilemez; once slotu baska profile gecir')
+    if os.path.exists(dst) and not overwrite: raise ApError(f'"{name}" already exists (pass overwrite=true to replace it)')
+    if name in _profile_users() and overwrite: raise ApError('a profile in use cannot be replaced; move that slot to another profile first')
     fd, tmp = tempfile.mkstemp(suffix='.conf', dir='/etc/wireguard', prefix='.upload-'); os.write(fd, conf_text.encode()); os.close(fd)
     os.chmod(tmp, 0o600)
     try:
-        rc, out, err = _run([SWAP, tmp], 60)   # kuru calisma = dogrulama
-        if rc != 0: raise ApError('config dogrulanamadi: ' + (err.strip() or out.strip())[-300:])
+        rc, out, err = _run([SWAP, tmp], 60)   # dry run = validation
+        if rc != 0: raise ApError('the config could not be validated: ' + (err.strip() or out.strip())[-300:])
         shutil.copy2(tmp, dst); os.chmod(dst, 0o600)
     finally:
         os.unlink(tmp)
-    return {'name': name, **_parse_conf(conf_text), 'warnings': [l.strip() for l in err.split('\n') if 'cikarildi' in l]}
+    return {'name': name, **_parse_conf(conf_text), 'warnings': [l.strip() for l in err.split('\n') if 'stripped' in l]}
 
 
 def vpn_remove(name):
-    if not _NAME.match(name or ''): raise ApError('gecersiz ad')
+    if not _NAME.match(name or ''): raise ApError('invalid name')
     u = _profile_users()
-    if name in u: raise ApError(f'profil {u[name]} slotunda aktif, once degistir')
+    if name in u: raise ApError(f'the profile is active on slot {u[name]}, change that slot first')
     p = os.path.join(PROFILES, name + '.conf')
-    if not os.path.exists(p): raise ApError('profil yok')
+    if not os.path.exists(p): raise ApError('no such profile')
     os.unlink(p); return {'removed': name}
 
 
-# ----------------------------------------------------------------- ATAMA SABITLEME (pin)
-# Yayin (SSID) <-> profil <-> VPN sunucu anahtari <-> radyo MAC dortlusu slot env'inde sabitlenir.
-# Sabiti yalnizca YAZILI ONAY gecmis islemler gunceller; ap-pin.sh sapmada yayini durdurur (fail-closed).
+# ----------------------------------------------------------------- ASSIGNMENT PINNING
+# The quadruple SSID <-> profile <-> VPN server key <-> radio MAC is pinned in the slot env.
+# Only operations that passed a typed confirmation update the pin; ap-pin.sh stops the SSID on drift (fail-closed).
 def _ssid_of(s): return _read_kv(_hostapd_path(s)).get('ssid') or ''
 
 
@@ -360,12 +372,12 @@ def _pin_info(s):
 
 
 def _pin_write(s):
-    """Slotun MEVCUT durumunu sabitle. SADECE yazili onay gecmis islemlerden cagrilir."""
+    """Pin the slot's CURRENT state. Called ONLY from operations that passed a typed confirmation."""
     s = _slot(s['SLOT']); env_path = os.path.join(SLOTS_DIR, s['SLOT'] + '.env')
     prof = s.get('PROFILE') or ''; peer = ''
     if prof:
         peer = _parse_conf(open(os.path.join(PROFILES, prof + '.conf')).read()).get('peer_pubkey') or ''
-        if not peer: raise ApError(f'profil {prof}: PublicKey yok, sabitlenemez')
+        if not peer: raise ApError(f'profile {prof}: no PublicKey, cannot be pinned')
     try: mac = open(f"/sys/class/net/{s['AP_IF']}/address").read().strip()
     except FileNotFoundError: mac = s.get('AP_MAC') or ''
     for k, v in (('PIN_SSID_HEX', _ssid_of(s).encode().hex()), ('PIN_PROFILE', prof), ('PIN_PEER', peer), ('AP_MAC', mac)):
@@ -381,11 +393,11 @@ def _pin_clear(s):
 
 
 def _require_confirm(confirm, *affected):
-    """Yayin-VPN eslesmesini degistiren islemler: etkilenen yayinlarin SSID'leri ' / ' ile birlestirilmis
-    halde AYNEN yazilmis olmali. Yanlis tiklamaya karsi; sistem bu degisikligi kendiliginden ASLA yapmaz."""
+    """For operations that change the SSID-VPN mapping: the affected SSIDs, joined with ' / ',
+    must be typed VERBATIM. Guards against a mis-click; the system NEVER makes this change on its own."""
     expected = ' / '.join(_ssid_of(x) for x in affected)
     if str(confirm or '').strip() != expected:
-        raise ApError(f'ONAY GEREKLI: bu islem yayin-VPN eslesmesini degistirir. Onaylamak icin aynen yazin: {expected}')
+        raise ApError(f'CONFIRMATION REQUIRED: this operation changes the SSID-VPN mapping. To confirm, type exactly: {expected}')
 
 
 def _slot_pin_impl(slot, confirm=None):
@@ -398,23 +410,24 @@ def _slot_pin_impl(slot, confirm=None):
 
 
 def _detach_profile(slot_env):
-    """Slotun tunelini kapat ve profil bagini kaldir (profil baska slota gecebilsin). Sabit de kalkar."""
+    """Stop the slot's tunnel and unbind its profile (so it can move to another slot). The pin is cleared too."""
     _run([SYSCTL, 'stop', f"wg-quick@{slot_env['WG_IF']}"], 60)
     _set_env_key(os.path.join(SLOTS_DIR, slot_env['SLOT'] + '.env'), 'PROFILE', ''); _pin_clear(slot_env)
-    _run([FIREWALL], 60)   # blackhole + killswitch bu slot icin devrede kalir (fail-closed)
+    _run([FIREWALL], 60)   # the blackhole + kill switch stay in place for this slot (fail-closed)
 
 
 def _vpn_activate_impl(name, slot=None, force=False, confirm=None, _internal=False):
-    """Profili slota ata. force=True: profil baska slottaysa oradan ALIR (o slot tunelsiz kalir, killswitch tutar).
-    ATAMA SABITLEME: _internal degilse etkilenen HER yayinin SSID'si 'confirm' ile aynen yazilmis olmali;
-    basarida sabit (PIN_*) guncellenir. Cagiran long_op kilidini tutar (ap-pin enforce bu sirada denetlemez)."""
+    """Assign a profile to a slot. force=True TAKES it from another slot (that slot is left without a
+    tunnel; the kill switch holds). PINNING: unless _internal, every affected SSID must be typed verbatim
+    in 'confirm'; on success the pin (PIN_*) is updated. The caller holds the long_op lock, so ap-pin
+    enforce skips its audit meanwhile."""
     s = _slot(slot)
-    if not _NAME.match(name or ''): raise ApError('gecersiz ad')
+    if not _NAME.match(name or ''): raise ApError('invalid name')
     p = os.path.join(PROFILES, name + '.conf')
-    if not os.path.exists(p): raise ApError('profil yok')
+    if not os.path.exists(p): raise ApError('no such profile')
     u = _profile_users()
     victim = _slot(u[name]) if u.get(name) and u[name] != s['SLOT'] else None
-    if victim and not force: raise ApError(f'"{name}" zaten {victim["SLOT"]} slotunda aktif (ayni anahtar iki tunelde kullanilamaz; force ile alinabilir)')
+    if victim and not force: raise ApError(f'"{name}" is already active on slot {victim["SLOT"]} (the same key cannot run in two tunnels; use force to take it)')
     if not _internal: _require_confirm(confirm, s, *([victim] if victim else []))
     if victim: _detach_profile(victim)
     was_detached = not s.get('PROFILE')
@@ -423,29 +436,30 @@ def _vpn_activate_impl(name, slot=None, force=False, confirm=None, _internal=Fal
     if ok:
         _set_env_key(os.path.join(SLOTS_DIR, s['SLOT'] + '.env'), 'PROFILE', name); _pin_write(s)
     elif was_detached:
-        # Koparilmis slotta swap script'in geri getirdigi 'eski' conf artik BASKA slota ait olabilir (takas yarida kaldi):
-        # ayni anahtar iki tunelde calismasin diye tunel kapatilir; slot profilsiz/sabitsiz kalir (killswitch tutar).
+        # On a detached slot the 'previous' conf restored by the swap script may now belong to ANOTHER slot
+        # (a half-finished swap): stop the tunnel so the same key never runs twice; the slot stays without a
+        # profile and without a pin (the kill switch holds).
         _run([SYSCTL, 'stop', f"wg-quick@{s['WG_IF']}"], 60); _run([FIREWALL], 60)
     tail = (out + '\n' + err).strip().split('\n')
-    summary = [l for l in tail if any(k in l for k in ('yeni cikis IP', 'PASS,', 'FAIL', 'geri', 'RED', 'handshake'))]
-    if not ok: raise ApError(('aktivasyon basarisiz (slot tunelsiz birakildi): ' if was_detached else 'aktivasyon basarisiz (eski profile geri donuldu): ') + '\n'.join(summary[-5:] or tail[-5:]))
+    summary = [l for l in tail if any(k in l for k in ('new exit IP', 'PASS,', 'FAIL', 'rolled back', 'REJECTED', 'handshake'))]
+    if not ok: raise ApError(('activation failed (the slot was left without a tunnel): ' if was_detached else 'activation failed (rolled back to the previous profile): ') + '\n'.join(summary[-5:] or tail[-5:]))
     return {'activated': True, 'name': name, 'slot': s['SLOT'], 'log': tail[-25:], 'summary': summary, 'pin': _pin_info(_slot(s['SLOT']))}
 
 
 def _vpn_swap_impl(slot_a, slot_b, confirm=None):
-    """Iki slotun profillerini takas et. Sira: B'yi kopar -> A'ya B'nin profilini ver -> B'ye A'nin eski profilini ver.
-    Onay: iki yayinin SSID'si de yazilmis olmali (' / ' ile, A B sirasiyla)."""
+    """Swap the profiles of two slots. Order: detach B -> give A the profile of B -> give B the old profile of A.
+    Confirmation: both SSIDs must be typed (joined with ' / ', in A B order)."""
     a, b = _slot(slot_a), _slot(slot_b)
-    if a['SLOT'] == b['SLOT']: raise ApError('ayni slot')
+    if a['SLOT'] == b['SLOT']: raise ApError('same slot')
     pa, pb = a.get('PROFILE') or None, b.get('PROFILE') or None
-    if not pa and not pb: raise ApError('iki slotta da profil yok')
+    if not pa and not pb: raise ApError('neither slot has a profile')
     _require_confirm(confirm, a, b)
     log = []
-    if pb: _detach_profile(b); log.append(f"{b['SLOT']}: {pb} koparildi")
+    if pb: _detach_profile(b); log.append(f"{b['SLOT']}: {pb} detached")
     if pb:
         r = _vpn_activate_impl(pb, a['SLOT'], _internal=True); log += r['summary']; log.append(f"{a['SLOT']} -> {pb}")
     else:
-        _detach_profile(a); log.append(f"{a['SLOT']}: {pa} koparildi")
+        _detach_profile(a); log.append(f"{a['SLOT']}: {pa} detached")
     if pa:
         r = _vpn_activate_impl(pa, b['SLOT'], _internal=True); log += r['summary']; log.append(f"{b['SLOT']} -> {pa}")
     return {'swapped': True, a['SLOT']: pb, b['SLOT']: pa, 'summary': log}
@@ -467,14 +481,14 @@ def _slot_enable_impl(slot, enabled):
 
 def exit_ip(slot=None):
     s = _slot(slot); addr = _iface_ip(s['WG_IF'])
-    if not addr: raise ApError(f"{s['WG_IF']} arayuzunde adres yok")
+    if not addr: raise ApError(f"no address on interface {s['WG_IF']}")
     src = addr.split('/')[0]
     rc, out, err = _run(['/usr/bin/curl', '-4', '-s', '-m', '8', '--interface', src, 'https://api.ipify.org'], 12)
-    if rc != 0 or not out.strip(): raise ApError('cikis IP alinamadi (tunel calismiyor olabilir)')
+    if rc != 0 or not out.strip(): raise ApError('could not read the exit IP (the tunnel may be down)')
     return {'slot': s['SLOT'], 'exit_ip': out.strip(), 'via': src}
 
 
-# ----------------------------------------------------------------- sistem
+# ----------------------------------------------------------------- system
 def _verify_impl(slot=None):
     targets = [_slot(slot)] if slot else list(slots().values())
     total_p = total_f = 0; fails = []; ok = True
@@ -514,13 +528,13 @@ _UPDATABLE = {'apctl.py': '/opt/ap-vpn/lib/apctl.py', 'ap-ble-agent.py': '/opt/a
 
 
 def agent_update(name, content, restart=True):
-    if name not in _UPDATABLE: raise ApError('sadece ' + ', '.join(_UPDATABLE) + ' guncellenebilir')
-    if not isinstance(content, str) or not (200 < len(content) < 400_000): raise ApError('icerik boyutu gecersiz')
+    if name not in _UPDATABLE: raise ApError('only ' + ', '.join(_UPDATABLE) + ' can be updated')
+    if not isinstance(content, str) or not (200 < len(content) < 400_000): raise ApError('invalid content size')
     dst = _UPDATABLE[name]
     fd, tmp = tempfile.mkstemp(suffix='.py', dir=os.path.dirname(dst), prefix='.upd-'); os.write(fd, content.encode()); os.close(fd)
     try:
         rc, out, err = _run([sys.executable, '-m', 'py_compile', tmp], 30)
-        if rc != 0: raise ApError('sozdizimi hatasi: ' + (err or out).strip()[-300:])
+        if rc != 0: raise ApError('syntax error: ' + (err or out).strip()[-300:])
         bak = dst + '.bak'
         if os.path.exists(dst): shutil.copy2(dst, bak)
         os.chmod(tmp, 0o755 if name.endswith('agent.py') else 0o644); os.replace(tmp, dst)
@@ -532,7 +546,7 @@ def agent_update(name, content, restart=True):
 
 def ble_setname(name):
     if not isinstance(name, str) or not (1 <= len(name.encode()) <= 20) or not re.match(r'\A[A-Za-z0-9 _.-]+\Z', name):
-        raise ApError('ad 1-20 bayt, harf/rakam/bosluk/-/_/. olabilir')
+        raise ApError('the name must be 1-20 bytes of letters/digits/space/-/_/.')
     _set_env_key(ENV, 'BLE_NAME', name)
     _run([SYSTEMD_RUN, '--on-active=3s', '--unit=ble-agent-restart', SYSCTL, 'restart', 'ap-ble-agent'], 5)
     return {'name': name, 'restart_in_s': 3}
@@ -546,13 +560,13 @@ def ble_token(regen=False):
 
 
 def ble_pair(seconds=120):
-    """Eslestirme penceresi ac: ajan bu dosyayi izler, Pairable'i gecici acar."""
+    """Open a pairing window: the agent watches this file and turns Pairable on temporarily."""
     seconds = max(10, min(int(seconds), 900)); os.makedirs(os.path.dirname(PAIR_FILE), exist_ok=True)
     with open(PAIR_FILE, 'w') as f: f.write(str(int(time.time()) + seconds))
-    return {'pairable_for_s': seconds, 'hint': 'Bu sure icinde yeni bir Mac baglanip eslesebilir; sonra kapi kapanir.'}
+    return {'pairable_for_s': seconds, 'hint': 'A new Mac can connect and pair during this window; afterwards the gate closes.'}
 
 
-# ----------------------------------------------------------------- uzun islem sarmalayicilari (kilitli)
+# ----------------------------------------------------------------- long-operation wrappers (locked)
 def wifi_set(slot=None, ssid=None, psk=None):
     with long_op('wifi.set'):
         return _wifi_set_impl(slot, ssid, psk)
@@ -589,7 +603,7 @@ def vpn_add(name, conf_text, overwrite=False):
 
 
 # ----------------------------------------------------------------- WEB
-WEB_PW = '/etc/ap-vpn/web-password'   # icerik: salt_hex$sha256(salt||pw)_hex
+WEB_PW = '/etc/ap-vpn/web-password'   # content: salt_hex$pbkdf2(salt, pw)_hex
 
 
 def _pw_hash(pw, salt):
@@ -597,14 +611,14 @@ def _pw_hash(pw, salt):
 
 
 def web_set_password(pw=None):
-    """Parola belirle (verilmezse rastgele uret ve dondur). Dosyada sadece hash tutulur."""
+    """Set the password (generate and return a random one when none is given). Only the hash is stored."""
     shown = None
     if not pw: pw = secrets.token_urlsafe(12); shown = pw
-    if not (8 <= len(pw) <= 128): raise ApError('parola 8-128 karakter olmali')
+    if not (8 <= len(pw) <= 128): raise ApError('the password must be 8-128 characters')
     salt = secrets.token_bytes(16)
     fd = os.open(WEB_PW, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     os.write(fd, f'{salt.hex()}${_pw_hash(pw, salt)}\n'.encode()); os.close(fd)
-    return {'set': True, 'password': shown, 'hint': 'Parola sadece simdi gosterildi; kaybedersen: sudo ap-ctl web password'}
+    return {'set': True, 'password': shown, 'hint': 'Shown only once; if you lose it: sudo ap-ctl web password'}
 
 
 def web_check_password(pw):
@@ -616,8 +630,8 @@ def web_check_password(pw):
 # ----------------------------------------------------------------- CLI
 def _cli(argv):
     import argparse
-    ap = argparse.ArgumentParser(prog='ap-ctl', description='Pi5 VPN-AP kontrol (coklu slot)')
-    ap.add_argument('--slot', help='slot adi (ap0, ap1 ...)')
+    ap = argparse.ArgumentParser(prog='ap-ctl', description='Raspberry Pi VPN-AP control (multi-slot)')
+    ap.add_argument('--slot', help='slot name (ap0, ap1 ...)')
     sub = ap.add_subparsers(dest='cmd', required=True)
     for c in ('status', 'clients', 'verify', 'exitip', 'slots'): sub.add_parser(c)
     k = sub.add_parser('kick'); k.add_argument('mac')
@@ -625,9 +639,9 @@ def _cli(argv):
     wset = ws.add_parser('set'); wset.add_argument('--ssid'); wset.add_argument('--psk')
     v = sub.add_parser('vpn'); vs = v.add_subparsers(dest='sub', required=True); vs.add_parser('list')
     va = vs.add_parser('add'); va.add_argument('name'); va.add_argument('file', nargs='?'); va.add_argument('--overwrite', action='store_true')
-    vr = vs.add_parser('remove'); vr.add_argument('name'); vx = vs.add_parser('activate'); vx.add_argument('name'); vx.add_argument('--force', action='store_true'); vx.add_argument('--confirm', help="etkilenen yayinlarin SSID'leri (' / ' ile)")
+    vr = vs.add_parser('remove'); vr.add_argument('name'); vx = vs.add_parser('activate'); vx.add_argument('name'); vx.add_argument('--force', action='store_true'); vx.add_argument('--confirm', help="the affected SSIDs, joined with ' / '")
     vsw = vs.add_parser('swap'); vsw.add_argument('slot_a'); vsw.add_argument('slot_b'); vsw.add_argument('--confirm', help="'SSID_A / SSID_B'")
-    sl = sub.add_parser('slot'); sls = sl.add_subparsers(dest='sub', required=True); sls.add_parser('enable'); sls.add_parser('disable'); sls.add_parser('pin').add_argument('--confirm', help='yayinin SSID\'si')
+    sl = sub.add_parser('slot'); sls = sl.add_subparsers(dest='sub', required=True); sls.add_parser('enable'); sls.add_parser('disable'); sls.add_parser('pin').add_argument('--confirm', help="the SSID of this slot")
     s = sub.add_parser('system'); ss = s.add_subparsers(dest='sub', required=True)
     slg = ss.add_parser('logs'); slg.add_argument('-n', type=int, default=60); slg.add_argument('-u'); ss.add_parser('reboot'); ss.add_parser('firewall')
     wb = sub.add_parser('web'); wbs = wb.add_subparsers(dest='sub', required=True); wp = wbs.add_parser('password'); wp.add_argument('value', nargs='?')
@@ -664,5 +678,5 @@ def _cli(argv):
 
 if __name__ == '__main__':
     if os.geteuid() != 0:
-        print(json.dumps({'error': 'root gerekli (sudo ap-ctl ...)'}), file=sys.stderr); sys.exit(1)
+        print(json.dumps({'error': 'root required (sudo ap-ctl ...)'}), file=sys.stderr); sys.exit(1)
     sys.exit(_cli(sys.argv[1:]))

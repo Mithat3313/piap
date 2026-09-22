@@ -1,5 +1,5 @@
 [Unit]
-Description=AP-VPN tunel watchdog (60sn)
+Description=AP-VPN tunnel watchdog (every 60 s)
 [Timer]
 OnBootSec=90
 OnUnitActiveSec=60

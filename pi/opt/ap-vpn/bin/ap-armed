@@ -1,8 +1,8 @@
 #!/bin/bash
-# Guvenlik agi: riskli bir ag degisikliginden ONCE calistir.
-#   sudo ap-armed [saniye]     (varsayilan 180)
-# Sure icinde 'sudo ap-confirm' calismazsa: firewall yedekten geri yuklenir, tum AP
-# slotlari kapatilir, LAN default rotasi garantiye alinir. SSH erisimini kaybetmemek icin.
+# Safety net: run BEFORE a risky network change.
+#   sudo ap-armed [seconds]     (default 180)
+# If 'sudo ap-confirm' is not run within that time: the firewall is restored from the backup,
+# every AP slot is shut down and the LAN default route is re-added. So you never lose SSH.
 SEC="${1:-180}"
 B=/opt/ap-vpn/backup
 install -d -m 0700 "$B"
@@ -13,8 +13,8 @@ LAN_GW=$(ip -o -4 route show default 2>/dev/null | awk '{print $3; exit}')
 rm -f /run/ap-confirmed
 systemd-run --unit=ap-rollback --on-active="${SEC}s" \
   /bin/bash -c '
-    if [ -f /run/ap-confirmed ]; then logger -t ap-armed "onaylandi, geri alma iptal"; exit 0; fi
-    logger -t ap-armed "ONAY GELMEDI - geri aliniyor"
+    if [ -f /run/ap-confirmed ]; then logger -t ap-armed "confirmed, rollback cancelled"; exit 0; fi
+    logger -t ap-armed "NO CONFIRMATION - rolling back"
     for f in /etc/ap-vpn/slots/*.env; do
       s=$(basename "$f" .env); unset AP_IF TABLE; . "$f"
       systemctl stop "ap-hostapd@$s" "ap-dnsmasq@$s" 2>/dev/null
@@ -23,6 +23,6 @@ systemd-run --unit=ap-rollback --on-active="${SEC}s" \
     iptables-restore  < '"$B"'/iptables.armed.rules  || true
     ip6tables-restore < '"$B"'/ip6tables.armed.rules || true
     [ -n "'"$LAN_GW"'" ] && { ip route show | grep -q "default via '"$LAN_GW"' dev '"$LAN_IF"'" || ip route add default via '"$LAN_GW"' dev '"$LAN_IF"' metric 100; }
-    logger -t ap-armed "geri alma tamam"
+    logger -t ap-armed "rollback complete"
   ' >/dev/null 2>&1
-echo "GUVENLIK AGI KURULDU: ${SEC}s icinde 'sudo ap-confirm' calismazsa ag durumu geri alinir."
+echo "SAFETY NET ARMED: unless 'sudo ap-confirm' runs within ${SEC}s, the network state is rolled back."

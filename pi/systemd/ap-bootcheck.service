@@ -1,5 +1,5 @@
 [Unit]
-Description=AP-VPN boot deadman: LAN gelmediyse AP kancalarini sok
+Description=AP-VPN boot deadman: detach the AP hooks if the LAN never comes up
 ConditionPathExists=!/etc/ap-vpn/DISABLED
 After=network.target
 

@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 
-/// Çıkışta BLE bağlantısını düzgün kapat (bluetoothd eski oturumu tutmasın).
+/// Close the BLE connection cleanly on quit, so bluetoothd does not keep a stale session.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var app: AppState?
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

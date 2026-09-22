@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ap-web — Pi5 VPN-AP web yonetim paneli (Flask, HTTPS :8443).
-Ayni cekirdek (apctl) — BLE ajaniyla ayni islemler, ayni kilit.
-Guvenlik: parola (PBKDF2, /etc/ap-vpn/web-password), oturum cerezi (HttpOnly+Secure+SameSite=Strict),
-durum degistiren isteklerde X-Requested-With: piap zorunlu (CSRF), giris hiz siniri (IP ve global),
-AP arayuzlerinden ve tunel arayuzlerinden erisim firewall'da kapali (sadece LAN/eth0).
+ap-web — web management panel for the Pi VPN-AP (Flask, HTTPS :8443).
+Same core (apctl) as the BLE agent: same operations, same lock.
+Security: password (PBKDF2, /etc/ap-vpn/web-password), session cookie (HttpOnly+Secure+SameSite=Strict),
+X-Requested-With: piap required on state-changing requests (CSRF), login rate limit (per IP and global).
+Access from the AP and tunnel interfaces is blocked in the firewall (LAN only).
 """
 import os, sys, time, json, secrets, functools, threading, logging
 from flask import Flask, request, jsonify, make_response, send_file, abort
@@ -53,9 +53,9 @@ def _session():
 def auth(f):
     @functools.wraps(f)
     def w(*a, **k):
-        if not _session(): return jsonify(ok=False, error='giris gerekli'), 401
+        if not _session(): return jsonify(ok=False, error='login required'), 401
         if request.method != 'GET' and request.headers.get('X-Requested-With') != 'piap':
-            return jsonify(ok=False, error='CSRF: X-Requested-With eksik'), 403
+            return jsonify(ok=False, error='CSRF: X-Requested-With missing'), 403
         return f(*a, **k)
     return w
 
@@ -67,13 +67,13 @@ def api(fn, *a, **k):
     try: return ok(fn(*a, **k))
     except apctl.ApError as e: return jsonify(ok=False, error=str(e)), 400
     except Exception as e:
-        log.exception('ic hata'); return jsonify(ok=False, error=f'ic hata: {e}'), 500
+        log.exception('internal error'); return jsonify(ok=False, error=f'internal error: {e}'), 500
 
 
 def body(): return request.get_json(silent=True) or {}
 
 
-# ---------------------------------------------------------------- sayfa
+# ---------------------------------------------------------------- page
 @app.get('/')
 def index():
     r = make_response(send_file(os.path.join(APP_DIR, 'index.html')))
@@ -83,17 +83,17 @@ def index():
     return r
 
 
-# ---------------------------------------------------------------- oturum
+# ---------------------------------------------------------------- session
 @app.post('/api/login')
 def login():
     ip = _client_ip()
-    if not _rate_ok(ip): return jsonify(ok=False, error='cok fazla basarisiz deneme, 10 dk bekleyin'), 429
+    if not _rate_ok(ip): return jsonify(ok=False, error='too many failed attempts, wait 10 minutes'), 429
     pw = str(body().get('password', ''))
     if not apctl.web_check_password(pw):
-        _fail(ip); log.warning(f'{ip}: basarisiz giris'); time.sleep(0.5)
-        return jsonify(ok=False, error='parola yanlis'), 401
+        _fail(ip); log.warning(f'{ip}: failed login'); time.sleep(0.5)
+        return jsonify(ok=False, error='wrong password'), 401
     sid = secrets.token_urlsafe(32); SESSIONS[sid] = {'exp': time.time() + SESSION_TTL, 'ip': ip}
-    log.info(f'{ip}: giris')
+    log.info(f'{ip}: logged in')
     r = ok({'authed': True}); r.set_cookie('piap_session', sid, max_age=SESSION_TTL, httponly=True, secure=True, samesite='Strict', path='/')
     return r
 
@@ -108,7 +108,7 @@ def logout():
 def me(): return ok({'authed': bool(_session()), 'name': apctl._env().get('BLE_NAME', 'PiAP')})
 
 
-# ---------------------------------------------------------------- okuma
+# ---------------------------------------------------------------- read
 @app.get('/api/status')
 @auth
 def status(): return api(apctl.status)
@@ -130,7 +130,7 @@ def wifi_get(slot): return api(apctl.wifi_get, slot)
 def logs(): return api(apctl.system_logs, request.args.get('lines', 80), request.args.get('unit'))
 
 
-# ---------------------------------------------------------------- yazma
+# ---------------------------------------------------------------- write
 @app.post('/api/slot/<slot>/enable')
 @auth
 def slot_enable(slot): return api(apctl.slot_enable, slot, True)
@@ -196,13 +196,13 @@ def password():
 
 
 @app.errorhandler(404)
-def nf(e): return jsonify(ok=False, error='yok'), 404
+def nf(e): return jsonify(ok=False, error='not found'), 404
 
 
 if __name__ == '__main__':
-    if os.geteuid() != 0: print('root gerekli'); sys.exit(1)
-    if not (os.path.exists(CERT) and os.path.exists(KEY)): print('sertifika yok:', CERT); sys.exit(1)
-    log.info(f'https://0.0.0.0:{PORT} (LAN); AP ve tunel arayuzlerinden firewall ile kapali')
+    if os.geteuid() != 0: print('root required'); sys.exit(1)
+    if not (os.path.exists(CERT) and os.path.exists(KEY)): print('no certificate:', CERT); sys.exit(1)
+    log.info(f'https://0.0.0.0:{PORT} (LAN only; the AP and tunnel interfaces are blocked in the firewall)')
     from werkzeug.serving import make_server
     srv = make_server('0.0.0.0', PORT, app, threaded=True, ssl_context=(CERT, KEY))
     srv.serve_forever()

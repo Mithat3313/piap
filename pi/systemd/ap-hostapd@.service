@@ -1,6 +1,6 @@
 [Unit]
-Description=AP slot %i: hostapd (WiFi erisim noktasi)
-# YAPISAL KILL-SWITCH: ap-firewall self-check gecmezse bu slot HIC yayina cikmaz.
+Description=AP slot %i: hostapd (Wi-Fi access point)
+# STRUCTURAL KILL SWITCH: if the ap-firewall self-check fails, this slot NEVER goes on the air.
 Requires=ap-firewall.service ap-wlan@%i.service
 After=ap-firewall.service ap-wlan@%i.service
 ConditionFileNotEmpty=/etc/hostapd/%i.conf
@@ -9,7 +9,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStartPre=-/usr/sbin/rfkill unblock wifi
-# ATAMA SABITLEME: SSID/profil/sunucu anahtari/radyo sabitle eslesmiyorsa yayin BASLAMAZ.
+# ASSIGNMENT PINNING: if the SSID/profile/server key/radio does not match the pin, the SSID does NOT start.
 ExecStartPre=/opt/ap-vpn/bin/ap-pin.sh check %i
 ExecStart=/usr/sbin/hostapd /etc/hostapd/%i.conf
 Restart=on-failure

@@ -1,10 +1,10 @@
 #!/bin/bash
 # =============================================================================
-#  /opt/ap-vpn/bin/ap-uninstall.sh — TAM GERI ALMA (coklu slot)
-#  Kullanim:  sudo ap-uninstall.sh            servisleri kapatir, kancalari soker, dosyalari birakir
-#             sudo ap-uninstall.sh --purge    config/anahtarlari zaman damgali yedege TASIR (silmez)
-#  LAN arayuzune, SSH'a, Docker'in kendi kurallarina ve Pi'nin diger servislerine DOKUNMAZ.
-#  Iki kez calistirilabilir.
+#  /opt/ap-vpn/bin/ap-uninstall.sh — COMPLETE REMOVAL (multi-slot)
+#  Usage:  sudo ap-uninstall.sh            stops services, removes hooks, leaves files in place
+#          sudo ap-uninstall.sh --purge    MOVES configs/keys to a timestamped backup (never deletes)
+#  Never touches the LAN interface, SSH, Docker's own rules or the Pi's other services.
+#  Safe to run twice.
 # =============================================================================
 set -u
 . /etc/ap-vpn/ap.env 2>/dev/null || true
@@ -12,7 +12,7 @@ PURGE=0; [ "${1:-}" = "--purge" ] && PURGE=1
 IPT=/usr/sbin/iptables; IP6T=/usr/sbin/ip6tables; IP=/usr/sbin/ip
 SLOTS=$(ls /etc/ap-vpn/slots/*.env 2>/dev/null || true)
 
-echo "== 1. servisler (once radyolar: acik+korumasiz AP birakmamak icin) =="
+echo "== 1. services (radios first, so no open unprotected AP is left behind) =="
 for f in $SLOTS; do
   s=$(basename "$f" .env); unset AP_IF WG_IF; . "$f"
   systemctl disable --now "ap-hostapd@$s" "ap-dnsmasq@$s" 2>/dev/null
@@ -21,7 +21,7 @@ for f in $SLOTS; do
 done
 systemctl disable --now ap-web ap-ble-agent ap-watchdog.timer ap-bootcheck.timer ap-firewall 2>/dev/null
 
-echo "== 2. firewall kancalari (Docker'in kendi zincirlerine dokunulmuyor) =="
+echo "== 2. firewall hooks (Docker's own chains are left alone) =="
 $IPT  -D INPUT       -j AP-VPN-IN  2>/dev/null
 $IPT  -D DOCKER-USER -j AP-VPN-FWD 2>/dev/null
 $IPT  -D FORWARD     -j AP-VPN-FWD 2>/dev/null
@@ -47,7 +47,7 @@ for f in $SLOTS; do
   $IP route flush table "$TABLE" 2>/dev/null
   $IP addr flush dev "$AP_IF" 2>/dev/null; $IP link set "$AP_IF" down 2>/dev/null
 done
-# 1000-1999 araligi bu projeye ayrilmisti; artik kalmasin
+# the 1000-1999 range belonged to this project; nothing should be left there
 $IP rule show | awk -F: '$1>=1000 && $1<2000 {print $1}' | while read -r p; do $IP rule del pref "$p" 2>/dev/null; done
 
 echo "== 4. NetworkManager / avahi / Docker drop-in =="
@@ -59,20 +59,20 @@ fi
 rm -f /etc/systemd/system/docker.service.d/10-ap-firewall.conf; rmdir /etc/systemd/system/docker.service.d 2>/dev/null
 
 if [ "$PURGE" = 1 ]; then
-  echo "== 5. purge: config + anahtarlar yedege tasiniyor (SILINMIYOR) =="
+  echo "== 5. purge: configs + keys are MOVED to a backup (not deleted) =="
   B=/opt/ap-vpn/backup/uninstall-$(date +%Y%m%d-%H%M%S); install -d -m 0700 "$B"
   for f in $SLOTS; do unset WG_IF; . "$f"; mv "/etc/wireguard/$WG_IF.conf" "$B/" 2>/dev/null; done
   mv /etc/ap-vpn "$B/ap-vpn" 2>/dev/null
   mv /etc/hostapd/ap*.conf "$B/" 2>/dev/null
   rm -f /etc/systemd/system/ap-*.service /etc/systemd/system/ap-*.timer /usr/local/sbin/ap-ctl
-  echo "   tasindi: $B  (PrivateKey/PSK/token/parola iceriyor — 0700)"
+  echo "   moved to: $B  (contains PrivateKey/PSK/token/password — mode 0700)"
 fi
 systemctl daemon-reload; systemctl reset-failed 2>/dev/null
 
 echo
-echo "== DOGRULAMA =="
+echo "== VERIFICATION =="
 echo "-- ip rule --";           $IP rule show
-echo "-- DOCKER-USER --";       $IPT -S DOCKER-USER 2>/dev/null || echo "(Docker yok)"
+echo "-- DOCKER-USER --";       $IPT -S DOCKER-USER 2>/dev/null || echo "(no Docker)"
 echo "-- nat POSTROUTING --";   $IPT -t nat -S POSTROUTING
-echo "-- adresler --";          $IP -br addr
-echo "Beklenen: ip rule = 0/32766/32767; AP-VPN-* zincirleri yok; AP arayuzleri adressiz/DOWN; LAN arayuzu ve SSH etkilenmedi."
+echo "-- addresses --";         $IP -br addr
+echo "Expected: ip rule = 0/32766/32767; no AP-VPN-* chains; AP interfaces without addresses and DOWN; LAN interface and SSH untouched."

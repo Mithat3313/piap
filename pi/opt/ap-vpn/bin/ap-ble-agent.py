@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
 """
-ap-ble-agent v2 — Pi5 VPN-AP icin BLE GATT yonetim arayuzu (PROTOKOL v2: uctan uca sifreli).
+ap-ble-agent — BLE GATT management interface for the Pi VPN-AP (protocol v2: end-to-end encrypted).
 
-  Servis  7f2a0001-9c1e-4b7a-8d3e-5a6b7c8d9e0f
-  RX      7f2a0002-...  (istemci -> Pi, write)
-  TX      7f2a0003-...  (Pi -> istemci, notify)
+  Service 7f2a0001-9c1e-4b7a-8d3e-5a6b7c8d9e0f
+  RX      7f2a0002-...  (client -> Pi, write)
+  TX      7f2a0003-...  (Pi -> client, notify)
 
-Cerceve (her BLE yazimi/bildirimi): 1 bayt baslik (bit7=FIN, bit0-6=sira) + yuk.
-Parcalar FIN'e kadar birlestirilir.
+Framing (every BLE write/notification): a 1-byte header (bit7=FIN, bits0-6=sequence) + payload.
+Fragments are reassembled until FIN.
 
-El sikisma (duz metin, sadece bu 4 mesaj):
+Handshake (plaintext, these 4 messages only):
   M->P {"op":"hello","v":2,"nonce":nc}
   P->M {"op":"challenge","v":2,"nonce":ns,"proof":HMAC(token,"srv|"+nc+"|"+ns),"name":BLE_NAME}
   M->P {"op":"auth","proof":HMAC(token,"cli|"+nc+"|"+ns)}
   P->M {"ok":true,"authed":true,"v":2}
-  K = HKDF-SHA256(ikm=token, salt=nc||ns, info="piap-ble-v2", 32 bayt)
+  K = HKDF-SHA256(ikm=token, salt=nc||ns, info="piap-ble-v2", 32 bytes)
 
-Sonrasi (her mesaj): counter(8B BE) || ChaCha20-Poly1305(K, nonce=dir(4B)||counter, JSON)
-  dir: b"c2p\\0" istemci->Pi, b"p2c\\0" Pi->istemci. Counter her yonde kesin artan (replay korumasi).
-  => TX bildirimlerini dinleyen ikinci bir abone SADECE sifreli metin gorur; sahte cerceveler tag'de duser;
-     relay bir peripheral anahtari bilemez (inceleme bulgulari 1, 2, 4).
+Afterwards (every message): counter(8B BE) || ChaCha20-Poly1305(K, nonce=dir(4B)||counter, JSON)
+  dir: b"c2p\\0" client->Pi, b"p2c\\0" Pi->client. The counter is strictly increasing in each
+  direction (replay protection).
+  => a second subscriber listening to the TX notifications sees ONLY ciphertext; forged frames fail
+     the tag; a relaying peripheral cannot know the key.
 
-Ek sertlestirme: Pairable VARSAYILAN KAPALI (ap-ctl ble pair N ile pencere; bonded cihaz yoksa ilk 10 dk acik),
-tek kimlik-dogrulanmis oturum (ikinci central dusurulur), global auth kilidi, uzun islemler icin kilit.
-Pi -> istemci yonunde token ve WireGuard private key ASLA gonderilmez.
+Further hardening: Pairable is OFF BY DEFAULT (open a window with 'ap-ctl ble pair N'; if no device is
+bonded, a window opens for the first 10 minutes), a single authenticated session (a second central is
+disconnected), a global auth lockout and a lock for long operations.
+The token and the WireGuard private key are NEVER sent from the Pi to the client.
 """
 import sys, os, json, hmac, hashlib, secrets, threading, time, struct, traceback, subprocess
 import dbus, dbus.service, dbus.mainloop.glib, dbus.exceptions
@@ -73,7 +75,7 @@ def derive_key(nc, ns):
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=bytes.fromhex(nc) + bytes.fromhex(ns), info=b'piap-ble-v2').derive(token_bytes())
 
 
-# ============================================================ oturum
+# ============================================================ sessions
 class Session:
     __slots__ = ('dev', 'authed', 'nc', 'ns', 'key', 'c2p_last', 'p2c_next', 'fails', 'buf', 'seq', 'mtu', 'last')
 
@@ -113,7 +115,7 @@ class Sessions:
     def punish(self, dev, s):
         now = time.time(); s.fails += 1; s.authed = False; s.key = None
         self.gfails = [t for t in self.gfails if now - t < LOCK_GLOBAL_WINDOW_S] + [now]
-        if s.fails >= LOCK_DEV_FAILS: self.lock[dev] = now + LOCK_DEV_S; s.fails = 0; log(f'{dev}: cihaz kilidi {LOCK_DEV_S}s')
+        if s.fails >= LOCK_DEV_FAILS: self.lock[dev] = now + LOCK_DEV_S; s.fails = 0; log(f'{dev}: device locked out for {LOCK_DEV_S}s')
         if len(self.gfails) >= LOCK_GLOBAL_FAILS: self.glock_until = now + LOCK_GLOBAL_S; log(f'GLOBAL auth kilidi {LOCK_GLOBAL_S}s')
 
     def drop(self, dev): self.s.pop(dev, None)
@@ -127,7 +129,7 @@ LONG_LOCK = threading.Lock()
 LONG_OPS = {'vpn.activate', 'vpn.swap', 'vpn.add', 'verify', 'wifi.set', 'exitip', 'firewall', 'agent.update', 'slot.enable', 'slot.disable', 'slot.pin'}
 
 
-# ============================================================ komutlar
+# ============================================================ commands
 def dispatch(msg):
     op = msg.get('op'); a = msg.get('args') or {}; slot = a.get('slot')
     if op == 'status':        return apctl.status()
@@ -217,11 +219,11 @@ class TxCharacteristic(Characteristic):
     def ReadValue(self, options):
         return dbus.Array([dbus.Byte(b) for b in json.dumps({'v': PROTO_VER, 'name': LOCAL_NAME}).encode()], signature='y')
     @dbus.service.method(IFACE_CHAR)
-    def StartNotify(self): self.notifying = True; log('TX: notify acildi')
+    def StartNotify(self): self.notifying = True; log('TX: notifications enabled')
     @dbus.service.method(IFACE_CHAR)
-    def StopNotify(self): self.notifying = False; log('TX: notify kapandi')
+    def StopNotify(self): self.notifying = False; log('TX: notifications disabled')
     def send_raw(self, data, mtu):
-        if not self.notifying: log('TX: abone yok, mesaj dusuruldu'); return
+        if not self.notifying: log('TX: no subscriber, message dropped'); return
         chunk = max(16, min(int(mtu), 512) - 3 - 1)
         parts = [data[i:i + chunk] for i in range(0, len(data), chunk)] or [b'']
         for i, p in enumerate(parts):
@@ -249,14 +251,14 @@ class RxCharacteristic(Characteristic):
         if s.authed and s.key:
             try: msg = s.open(data)
             except Exception as e:
-                log(f'{dev}: sifreli mesaj acilamadi ({e}) - oturum dusuruldu'); s.authed = False; s.key = None
-                self._plain(s, {'ok': False, 'error': 'oturum gecersiz, yeniden hello'}); return
+                log(f'{dev}: could not open the encrypted message ({e}) - session dropped'); s.authed = False; s.key = None
+                self._plain(s, {'ok': False, 'error': 'session invalid, send hello again'}); return
             self._command(s, msg); return
         try:
             msg = json.loads(data.decode('utf-8'))
-            if not isinstance(msg, dict): raise ValueError('dict degil')
+            if not isinstance(msg, dict): raise ValueError('not a dict')
         except Exception as e:
-            self._plain(s, {'ok': False, 'error': f'gecersiz JSON: {e}'}); return
+            self._plain(s, {'ok': False, 'error': f'invalid JSON: {e}'}); return
         self._handshake(s, msg)
 
     def _plain(self, s, obj):
@@ -265,7 +267,7 @@ class RxCharacteristic(Characteristic):
 
     def _sealed(self, s, obj):
         try: data = s.seal(obj)
-        except Exception as e: log('seal hatasi', e); return
+        except Exception as e: log('seal error', e); return
         GLib.idle_add(lambda: (self.tx.send_raw(data, s.mtu), False)[1])
 
     def _handshake(self, s, msg):
@@ -273,9 +275,9 @@ class RxCharacteristic(Characteristic):
         if op == 'hello':
             nc = str(msg.get('nonce', ''))
             if msg.get('v') != PROTO_VER or len(nc) != 32 or any(c not in '0123456789abcdef' for c in nc):
-                self._plain(s, {'id': mid, 'ok': False, 'error': f'protokol v{PROTO_VER} gerekli (uygulamayi guncelleyin)'}); return
+                self._plain(s, {'id': mid, 'ok': False, 'error': f'protocol v{PROTO_VER} required (update the app)'}); return
             if SESS.authed_other(s.dev):
-                self._plain(s, {'id': mid, 'ok': False, 'error': 'baska bir oturum aktif'}); log(f'{s.dev}: ikinci oturum reddedildi'); return
+                self._plain(s, {'id': mid, 'ok': False, 'error': 'another session is active'}); log(f'{s.dev}: second session refused'); return
             s.authed = False; s.key = None; s.nc = nc; s.ns = secrets.token_hex(16)
             proof = hmac.new(token_bytes(), f'srv|{s.nc}|{s.ns}'.encode(), hashlib.sha256).hexdigest()
             self._plain(s, {'id': mid, 'op': 'challenge', 'v': PROTO_VER, 'nonce': s.ns, 'proof': proof, 'name': LOCAL_NAME}); return
@@ -285,31 +287,31 @@ class RxCharacteristic(Characteristic):
             given = str(msg.get('proof', '')); nc, ns = s.nc, s.ns; s.nc = s.ns = None
             if hmac.compare_digest(expect, given):
                 s.key = derive_key(nc, ns); s.c2p_last = -1; s.p2c_next = 0; s.authed = True; s.fails = 0
-                log(f'{s.dev}: kimlik dogrulandi (v2, sifreli oturum)')
+                log(f'{s.dev}: authenticated (v2, encrypted session)')
                 self._plain(s, {'id': mid, 'ok': True, 'authed': True, 'v': PROTO_VER}); return
             SESS.punish(s.dev, s); log(f'{s.dev}: auth BASARISIZ')
-            self._plain(s, {'id': mid, 'ok': False, 'error': 'kimlik dogrulama basarisiz'}); return
-        self._plain(s, {'id': mid, 'ok': False, 'error': 'yetkisiz (once hello+auth)'})
+            self._plain(s, {'id': mid, 'ok': False, 'error': 'authentication failed'}); return
+        self._plain(s, {'id': mid, 'ok': False, 'error': 'unauthorized (hello+auth first)'})
 
     def _command(self, s, msg):
         op = msg.get('op'); mid = msg.get('id')
         def work():
             try: out = {'id': mid, 'ok': True, 'result': dispatch(msg)}
             except apctl.ApError as e: out = {'id': mid, 'ok': False, 'error': str(e)}
-            except Exception as e: log('HATA', op, traceback.format_exc()); out = {'id': mid, 'ok': False, 'error': f'ic hata: {e}'}
+            except Exception as e: log('ERROR', op, traceback.format_exc()); out = {'id': mid, 'ok': False, 'error': f'internal error: {e}'}
             finally:
                 if op in LONG_OPS: LONG_LOCK.release()
             self._sealed(s, out)
         if op in LONG_OPS:
             if not LONG_LOCK.acquire(blocking=False):
-                self._sealed(s, {'id': mid, 'ok': False, 'error': 'baska bir uzun islem suruyor, bekleyin'}); return
+                self._sealed(s, {'id': mid, 'ok': False, 'error': 'another long operation is running, please wait'}); return
             self._sealed(s, {'id': mid, 'ack': True, 'op': op})
             threading.Thread(target=work, daemon=True).start()
         else:
             work()
 
 
-# ============================================================ reklam / agent
+# ============================================================ advertising / agent
 class Advertisement(dbus.service.Object):
     PATH = '/org/apvpn/adv0'
     def __init__(self, bus): super().__init__(bus, self.PATH)
@@ -321,11 +323,11 @@ class Advertisement(dbus.service.Object):
         if iface != IFACE_ADV: raise InvalidArgs()
         return self.props()
     @dbus.service.method(IFACE_ADV)
-    def Release(self): log('reklam serbest birakildi')
+    def Release(self): log('advertisement released')
 
 
 class Agent(dbus.service.Object):
-    """Just-Works. Gercek kimlik = HMAC/AEAD; eslestirme kapisi Pairable ile kontrol edilir."""
+    """Just-Works pairing. Real authentication is the HMAC/AEAD layer; the pairing gate is Pairable."""
     PATH = '/org/apvpn/agent'
     def __init__(self, bus): super().__init__(bus, self.PATH)
     @dbus.service.method(IFACE_AGENT)
@@ -341,7 +343,7 @@ class Agent(dbus.service.Object):
     @dbus.service.method(IFACE_AGENT, in_signature='os')
     def DisplayPinCode(self, device, pincode): pass
     @dbus.service.method(IFACE_AGENT, in_signature='ou')
-    def RequestConfirmation(self, device, passkey): log(f'eslestirme kabul: {device}')
+    def RequestConfirmation(self, device, passkey): log(f'pairing accepted: {device}')
     @dbus.service.method(IFACE_AGENT, in_signature='o')
     def RequestAuthorization(self, device): log(f'yetkilendirme kabul: {device}')
     @dbus.service.method(IFACE_AGENT)
@@ -379,17 +381,17 @@ def bonded_count(bus):
 def main():
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True); dbus.mainloop.glib.threads_init()
     bus = dbus.SystemBus(); adapter = find_adapter(bus)
-    if not adapter: log('GATT/LEAdvertising destekli adaptor yok'); sys.exit(1)
-    log(f'adaptor: {adapter} proto=v{PROTO_VER} link-encrypt={ENCRYPT_LINK} name={LOCAL_NAME}')
+    if not adapter: log('no adapter with GATT/LEAdvertising support'); sys.exit(1)
+    log(f'adapter: {adapter} proto=v{PROTO_VER} link-encrypt={ENCRYPT_LINK} name={LOCAL_NAME}')
     props = dbus.Interface(bus.get_object(BLUEZ, adapter), DBUS_PROP)
     props.Set(IFACE_ADAPTER, 'Powered', dbus.Boolean(True)); props.Set(IFACE_ADAPTER, 'Alias', dbus.String(LOCAL_NAME))
     props.Set(IFACE_ADAPTER, 'Discoverable', dbus.Boolean(False))
     apctl.ble_token()
 
-    # ---- eslestirme kapisi: varsayilan KAPALI; pencere = /run/ap-vpn/ble-pair-until; bonded cihaz yoksa ilk 10 dk acik
+    # ---- pairing gate: OFF by default; window = /run/ap-vpn/ble-pair-until; open for the first 10 min when nothing is bonded
     pair_state = {'open': None}
     if bonded_count(bus) == 0:
-        apctl.ble_pair(FIRST_PAIR_WINDOW_S); log(f'bonded cihaz yok -> {FIRST_PAIR_WINDOW_S}s eslestirme penceresi')
+        apctl.ble_pair(FIRST_PAIR_WINDOW_S); log(f'no bonded device -> pairing window of {FIRST_PAIR_WINDOW_S}s')
     def pair_tick():
         try: until = int(open(apctl.PAIR_FILE).read().strip())
         except Exception: until = 0
@@ -397,7 +399,7 @@ def main():
         if want != pair_state['open']:
             props.Set(IFACE_ADAPTER, 'Pairable', dbus.Boolean(want))
             if want: props.Set(IFACE_ADAPTER, 'PairableTimeout', dbus.UInt32(max(10, int(until - time.time()))))
-            pair_state['open'] = want; log('eslestirme penceresi ' + ('ACIK' if want else 'kapali'))
+            pair_state['open'] = want; log('pairing window ' + ('OPEN' if want else 'closed'))
         return True
     pair_tick(); GLib.timeout_add_seconds(5, pair_tick)
 
@@ -406,30 +408,30 @@ def main():
     agent = Agent(bus); am = dbus.Interface(bus.get_object(BLUEZ, '/org/bluez'), IFACE_AGENT_MGR)
     am.RegisterAgent(Agent.PATH, 'NoInputNoOutput'); am.RequestDefaultAgent(Agent.PATH)
     gm = dbus.Interface(bus.get_object(BLUEZ, adapter), IFACE_GATT_MGR)
-    gm.RegisterApplication(Application.PATH, {}, reply_handler=lambda: log('GATT uygulamasi kayitli'),
-                           error_handler=lambda e: (log('GATT kayit HATASI', e), sys.exit(1)))
+    gm.RegisterApplication(Application.PATH, {}, reply_handler=lambda: log('GATT application registered'),
+                           error_handler=lambda e: (log('GATT registration ERROR', e), sys.exit(1)))
     adv = Advertisement(bus); lm = dbus.Interface(bus.get_object(BLUEZ, adapter), IFACE_ADV_MGR); state = {'mode': None}
-    def adv_ok(): state['mode'] = 'dbus'; log(f'LE reklami yayinda (D-Bus): "{LOCAL_NAME}"')
+    def adv_ok(): state['mode'] = 'dbus'; log(f'LE advertising is up (D-Bus): "{LOCAL_NAME}"')
     def adv_fail(e):
-        log('D-Bus reklam reddedildi -> legacy btmgmt')
-        if mgmt_adv_start(): state['mode'] = 'mgmt'; log(f'LE reklami yayinda (legacy mgmt): "{LOCAL_NAME}"')
-        else: log('HICBIR reklam yolu calismadi'); sys.exit(1)
+        log('D-Bus advertising refused -> legacy btmgmt')
+        if mgmt_adv_start(): state['mode'] = 'mgmt'; log(f'LE advertising is up (legacy mgmt): "{LOCAL_NAME}"')
+        else: log('NO advertising path worked'); sys.exit(1)
     lm.RegisterAdvertisement(Advertisement.PATH, {}, reply_handler=adv_ok, error_handler=adv_fail)
     def adv_refresh():
         if state['mode'] == 'mgmt': mgmt_adv_start()
         return True
     GLib.timeout_add_seconds(60, adv_refresh)
 
-    # ---- tek oturum: kimligi dogrulanmis oturum varken baglanan ikinci cihazi dusur; kopanin oturumunu sil
+    # ---- single session: disconnect a second central while an authenticated session exists; drop the session of whoever leaves
     def on_props(iface, changed, invalidated, path=None):
         if iface != IFACE_DEVICE or 'Connected' not in changed: return
         p = str(path)
         if changed['Connected']:
             if SESS.authed_other(p):
-                try: dbus.Interface(bus.get_object(BLUEZ, p), IFACE_DEVICE).Disconnect(); log(f'{p}: ikinci central dusuruldu')
-                except Exception as e: log('disconnect hatasi', e)
+                try: dbus.Interface(bus.get_object(BLUEZ, p), IFACE_DEVICE).Disconnect(); log(f'{p}: second central disconnected')
+                except Exception as e: log('disconnect error', e)
         else:
-            SESS.drop(p); log(f'{p}: baglanti koptu, oturum silindi')
+            SESS.drop(p); log(f'{p}: disconnected, session dropped')
     bus.add_signal_receiver(on_props, dbus_interface=DBUS_PROP, signal_name='PropertiesChanged', path_keyword='path')
 
     loop = GLib.MainLoop()
@@ -444,5 +446,5 @@ def main():
 
 
 if __name__ == '__main__':
-    if os.geteuid() != 0: log('root gerekli'); sys.exit(1)
+    if os.geteuid() != 0: log('root required'); sys.exit(1)
     main()

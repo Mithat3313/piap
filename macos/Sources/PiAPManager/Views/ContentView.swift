@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum Section: String, CaseIterable, Identifiable {
-    case status = "Yayınlar", clients = "İstemciler", wifi = "Wi-Fi", vpn = "VPN", logs = "Günlük"
+    case status = "SSIDs", clients = "Clients", wifi = "Wi-Fi", vpn = "VPN", logs = "Log"
     var id: String { rawValue }
     var icon: String {
         switch self {
@@ -14,7 +14,7 @@ enum Section: String, CaseIterable, Identifiable {
     }
 }
 
-/// Kapı: bağlı değilken SADECE bağlantı ekranı. Bağlanınca ana arayüz. Kopunca geri.
+/// Gate: while disconnected, ONLY the connect screen. Once connected, the main UI. Back on disconnect.
 struct ContentView: View {
     @EnvironmentObject var app: AppState
     var body: some View {
@@ -24,7 +24,7 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Ana arayüz (sadece bağlıyken)
+// MARK: - Main UI (only while connected)
 struct MainView: View {
     @EnvironmentObject var app: AppState
     @State private var section: Section = .status
@@ -59,21 +59,21 @@ struct MainView: View {
             HStack(spacing: 6) {
                 Circle().fill(.green).frame(width: 8, height: 8)
                 Text(app.ble.connectedID.flatMap { app.nickname($0) } ?? app.ble.peripheralName).font(.caption).bold(); Spacer()
-                Image(systemName: "lock.fill").font(.caption2).foregroundStyle(.green).help("Uçtan uca şifreli oturum (v2)")
+                Image(systemName: "lock.fill").font(.caption2).foregroundStyle(.green).help("End-to-end encrypted session (v2)")
                 Text("MTU \(app.ble.mtu)").font(.caption2).foregroundStyle(.secondary)
             }
             if let b = app.busy { HStack(spacing: 6) { ProgressView().controlSize(.mini); Text(b).font(.caption2).lineLimit(1) } }
-            Button("Bağlantıyı kes", role: .destructive) { app.ble.disconnect() }.controlSize(.small).frame(maxWidth: .infinity)
+            Button("Disconnect", role: .destructive) { app.ble.disconnect() }.controlSize(.small).frame(maxWidth: .infinity)
         }
         .padding(10).background(.bar)
     }
 }
 
-// MARK: - Bağlantı kapısı
+// MARK: - Connect gate
 struct ConnectView: View {
     @EnvironmentObject var app: AppState
     @State private var connectingID: UUID? = nil
-    @State private var tokenPrompt: BLEClient.Found? = nil     // anahtar sorulacak cihaz
+    @State private var tokenPrompt: BLEClient.Found? = nil     // device whose key we are asking for
     @State private var promptMessage: String? = nil
     @State private var namePrompt: BLEClient.Found? = nil
 
@@ -87,7 +87,7 @@ struct ConnectView: View {
             VStack(spacing: 6) {
                 Image(systemName: "antenna.radiowaves.left.and.right.circle.fill").font(.system(size: 52)).foregroundStyle(.tint)
                 Text("PiAP Manager").font(.title).bold()
-                Text("Yakındaki Raspberry Pi erişim noktasını seçin. Her cihazın kendi erişim anahtarı vardır; ilk bağlantıda sorulur, sonra hatırlanır.")
+                Text("Pick a nearby Raspberry Pi access point. Every device has its own access key; it is asked for on the first connection and remembered afterwards.")
                     .foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 460)
             }
 
@@ -96,9 +96,9 @@ struct ConnectView: View {
                     if app.ble.found.isEmpty {
                         HStack(spacing: 10) {
                             if scanning || app.ble.state == .starting { ProgressView().controlSize(.small) }
-                            Text(scanning ? "Aranıyor… Pi'nin açık ve 10 m içinde olması gerekir."
-                                          : app.ble.state == .starting ? "Bluetooth hazırlanıyor…"
-                                          : app.ble.state == .off ? "Bluetooth kapalı." : "Cihaz bulunamadı.")
+                            Text(scanning ? "Scanning… the Pi must be powered on and within about 10 m."
+                                          : app.ble.state == .starting ? "Preparing Bluetooth…"
+                                          : app.ble.state == .off ? "Bluetooth is off." : "No device found.")
                                 .foregroundStyle(.secondary)
                         }.frame(maxWidth: .infinity, minHeight: 60)
                     } else {
@@ -107,8 +107,8 @@ struct ConnectView: View {
                 }
             } label: {
                 HStack {
-                    Text("Cihazlar"); Spacer()
-                    Button(scanning ? "Durdur" : "Yeniden tara") { scanning ? app.ble.stopScan() : app.ble.startScan() }
+                    Text("Devices"); Spacer()
+                    Button(scanning ? "Stop" : "Scan again") { scanning ? app.ble.stopScan() : app.ble.startScan() }
                         .controlSize(.small).disabled(inProgress)
                 }
             }
@@ -125,8 +125,8 @@ struct ConnectView: View {
         .onChange(of: app.ble.state) { _, s in
             if s == .idle { connectingID = nil; app.ble.startScan() }
             if case .error(let e) = s, e.contains("token"), let id = connectingID, let d = app.ble.found.first(where: { $0.id == id }) {
-                // yanlış anahtar → aynı cihaz için tekrar sor
-                promptMessage = "Anahtar reddedildi. Bu cihazın anahtarını yeniden girin."
+                // wrong key → ask again for the same device
+                promptMessage = "The key was rejected. Enter the key for this device again."
                 tokenPrompt = d
             }
         }
@@ -148,7 +148,7 @@ struct ConnectView: View {
         Button {
             guard !inProgress else { return }
             connectingID = d.id; promptMessage = nil
-            if !app.connect(d.id) { tokenPrompt = d }        // anahtar yoksa sor
+            if !app.connect(d.id) { tokenPrompt = d }        // ask when no key is stored
         } label: {
             HStack(spacing: 12) {
                 Image(systemName: "dot.radiowaves.left.and.right").font(.title2)
@@ -156,8 +156,8 @@ struct ConnectView: View {
                     HStack(spacing: 6) {
                         Text(app.displayName(d)).font(.headline)
                         if app.nickname(d.id) != nil { Text(d.name).font(.caption).foregroundStyle(.secondary) }
-                        if known { Image(systemName: "key.fill").font(.caption).foregroundStyle(.green).help("Anahtar kayıtlı") }
-                        else { Text("anahtar gerekli").font(.caption2).padding(.horizontal, 5).background(.orange.opacity(0.2)).clipShape(Capsule()) }
+                        if known { Image(systemName: "key.fill").font(.caption).foregroundStyle(.green).help("Key stored") }
+                        else { Text("key required").font(.caption2).padding(.horizontal, 5).background(.orange.opacity(0.2)).clipShape(Capsule()) }
                     }
                     Text(d.id.uuidString).font(.caption2).foregroundStyle(.secondary).monospaced()
                 }
@@ -176,14 +176,14 @@ struct ConnectView: View {
         .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.5)))
         .disabled(inProgress)
         .contextMenu {
-            Button("Ad ver / değiştir…") { namePrompt = d }
-            Button("Anahtarı değiştir…") { promptMessage = nil; tokenPrompt = d }
-            if known { Button("Anahtarı unut", role: .destructive) { app.forgetToken(d.id) } }
+            Button("Set / change name…") { namePrompt = d }
+            Button("Change key…") { promptMessage = nil; tokenPrompt = d }
+            if known { Button("Forget key", role: .destructive) { app.forgetToken(d.id) } }
         }
     }
 }
 
-/// Cihaza özel erişim anahtarı girişi.
+/// Per-device access key entry.
 struct TokenSheet: View {
     let device: BLEClient.Found
     let message: String?
@@ -200,31 +200,31 @@ struct TokenSheet: View {
             HStack(spacing: 10) {
                 Image(systemName: "key.horizontal.fill").font(.title).foregroundStyle(.tint)
                 VStack(alignment: .leading) {
-                    Text("\(device.name) için erişim anahtarı").font(.headline)
+                    Text("Access key for \(device.name)").font(.headline)
                     Text(device.id.uuidString).font(.caption2).monospaced().foregroundStyle(.secondary)
                 }
             }
             if let m = message { Label(m, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red).font(.callout) }
-            TextField("Takma ad (isteğe bağlı) — örn. Ev Pi, Ofis Pi", text: $name).textFieldStyle(.roundedBorder)
+            TextField("Nickname (optional) — e.g. Home Pi, Office Pi", text: $name).textFieldStyle(.roundedBorder)
                 .onAppear { name = initialName }
             HStack {
-                Group { if show { TextField("64 karakter hex", text: $token) } else { SecureField("64 karakter hex", text: $token) } }
+                Group { if show { TextField("64 hex characters", text: $token) } else { SecureField("64 hex characters", text: $token) } }
                     .textFieldStyle(.roundedBorder).font(.system(.body, design: .monospaced))
                     .onSubmit { if valid { submit() } }
-                Button(show ? "Gizle" : "Göster") { show.toggle() }
+                Button(show ? "Hide" : "Show") { show.toggle() }
             }
-            Text("Anahtarı Pi'de bir kez alın: `sudo ap-ctl ble token`. Bu Mac'te Keychain'de yalnızca bu cihaz için saklanır; Bluetooth'tan hiç geçmez (sadece HMAC imzası gider).")
+            Text("Read the key once on the Pi: `sudo ap-ctl ble token`. It is stored in this Mac's keychain for this device only and never travels over Bluetooth (only an HMAC proof does).")
                 .font(.caption).foregroundStyle(.secondary)
-            if !token.isEmpty && !valid { Text("64 hex karakter olmalı (şu an \(token.count)).").font(.caption).foregroundStyle(.orange) }
-            HStack { Spacer(); Button("Vazgeç") { dismiss() }.keyboardShortcut(.cancelAction)
-                     Button("Kaydet ve bağlan") { submit() }.keyboardShortcut(.defaultAction).disabled(!valid) }
+            if !token.isEmpty && !valid { Text("Must be 64 hex characters (currently \(token.count)).").font(.caption).foregroundStyle(.orange) }
+            HStack { Spacer(); Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                     Button("Save and connect") { submit() }.keyboardShortcut(.defaultAction).disabled(!valid) }
         }
         .padding(20).frame(width: 520)
     }
     private func submit() { onSubmit(token.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), name); dismiss() }
 }
 
-/// Sadece takma ad düzenleme.
+/// Nickname editing only.
 struct NameSheet: View {
     let device: BLEClient.Found
     let initial: String
@@ -233,12 +233,12 @@ struct NameSheet: View {
     @State private var name = ""
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("\(device.name) için takma ad").font(.headline)
+            Text("Nickname for \(device.name)").font(.headline)
             Text(device.id.uuidString).font(.caption2).monospaced().foregroundStyle(.secondary)
-            TextField("örn. Ev Pi, Ofis Pi (boş = kaldır)", text: $name).textFieldStyle(.roundedBorder)
+            TextField("e.g. Home Pi, Office Pi (empty = remove)", text: $name).textFieldStyle(.roundedBorder)
                 .onAppear { name = initial }.onSubmit { onSubmit(name); dismiss() }
-            HStack { Spacer(); Button("Vazgeç") { dismiss() }.keyboardShortcut(.cancelAction)
-                     Button("Kaydet") { onSubmit(name); dismiss() }.keyboardShortcut(.defaultAction) }
+            HStack { Spacer(); Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                     Button("Save") { onSubmit(name); dismiss() }.keyboardShortcut(.defaultAction) }
         }.padding(20).frame(width: 420)
     }
 }

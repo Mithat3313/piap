@@ -1,46 +1,46 @@
 #!/bin/bash
 # =============================================================================
-#  /opt/ap-vpn/bin/ap-firewall.sh   (v4 — COKLU SLOT)
-#  Her slot = {AP_IF, AP_NET, WG_IF, TABLE, PRIO_*}. Slot dosyalari:
-#      /etc/ap-vpn/slots/<slot>.env   (ENABLED=1 olanlar islenir)
-#  Garanti: slot X'in istemcileri SADECE slot X'in tunelinden cikar.
-#    - wlanX -> wgX ACCEPT, wlanX -> (baska her sey) DROP  => capraz slot sizintisi imkansiz
-#    - her slotun kendi routing tablosu + blackhole kurali (tunel dusunce main'e DUSMEZ)
-#  Zincirler ortak, kurallar slot basina. Idempotent: zincirler flush + yeniden.
-#  Sonda slot basina self-check; biri bile eksikse exit 1 -> hostapd@* baslamaz.
+#  /opt/ap-vpn/bin/ap-firewall.sh   (multi-slot)
+#  Each slot = {AP_IF, AP_NET, WG_IF, TABLE, PRIO_*}. Slot files:
+#      /etc/ap-vpn/slots/<slot>.env   (only ENABLED=1 slots are processed)
+#  Guarantee: clients of slot X exit ONLY through slot X's tunnel.
+#    - wlanX -> wgX ACCEPT, wlanX -> (anything else) DROP  => cross-slot leaks are impossible
+#    - every slot has its own routing table + blackhole rule (an empty table never falls through to main)
+#  The chains are shared, the rules are per slot. Idempotent: chains are flushed and rewritten.
+#  A per-slot self-check runs at the end; if anything is missing, exit 1 -> ap-hostapd@* will not start.
 # =============================================================================
 set -u
 . /etc/ap-vpn/ap.env
 IPT=/usr/sbin/iptables; IP6T=/usr/sbin/ip6tables; IP=/usr/sbin/ip; SYSCTL=/usr/sbin/sysctl
 SLOTS_DIR=/etc/ap-vpn/slots
 
-die(){ logger -t ap-firewall -p daemon.err "HATA: $*"; echo "ap-firewall: HATA: $*" >&2; exit 1; }
+die(){ logger -t ap-firewall -p daemon.err "ERROR: $*"; echo "ap-firewall: ERROR: $*" >&2; exit 1; }
 mkchain(){ $IPT -t "$1" -N "$2" 2>/dev/null || $IPT -t "$1" -F "$2"; }
 hook(){    $IPT -t "$1" -C "$2" -j "$3" 2>/dev/null || $IPT -t "$1" -I "$2" 1 -j "$3"; }
 
-# ------------------------------------------------------------- 0. global on-ucus
+# ------------------------------------------------------------- 0. global pre-flight
 DEF_IF=$($IP -o -4 route show default | awk '{print $5; exit}')
-[ -n "$DEF_IF" ] || die "default route yok - hicbir seye dokunmuyorum"
+[ -n "$DEF_IF" ] || die "no default route - refusing to touch anything"
 if systemctl is-enabled --quiet nftables.service 2>/dev/null; then
-  die "nftables.service ENABLED - /etc/nftables.conf flush ruleset ile Docker tablolarini ve kill-switch'i siler"
+  die "nftables.service is ENABLED - /etc/nftables.conf runs flush ruleset and wipes Docker's tables and the kill switch"
 fi
 SLOT_FILES=$(ls "$SLOTS_DIR"/*.env 2>/dev/null) || true
-[ -n "$SLOT_FILES" ] || die "hic slot yok ($SLOTS_DIR)"
+[ -n "$SLOT_FILES" ] || die "no slots found ($SLOTS_DIR)"
 
-# slot env'ini alt kabukta degil, degiskenleri temizleyerek yukle
+# load the slot env in this shell (not a subshell), clearing the variables first
 load_slot(){
   unset AP_IF AP_NET AP_GW AP_ADDR WG_IF TABLE PRIO_WGSRC PRIO_APNET PRIO_BLACKHOLE ENABLED PROFILE AP_TEST_SRC
   . "$1"
   SLOT=$(basename "$1" .env)
   : "${ENABLED:=1}"
-  [ "$AP_IF" != "$LAN_IF" ] || die "$SLOT: AP_IF ile LAN_IF ayni"
-  [ "$AP_IF" != "$DEF_IF" ]  || die "$SLOT: default route $AP_IF uzerinde - SSH'i keserdi"
+  [ "$AP_IF" != "$LAN_IF" ] || die "$SLOT: AP_IF is the same as LAN_IF"
+  [ "$AP_IF" != "$DEF_IF" ]  || die "$SLOT: the default route is on $AP_IF - this would cut SSH"
   LAN_PFX=$($IP -4 -o addr show dev "$LAN_IF" 2>/dev/null | awk '{print $4}' | cut -d. -f1-3 | head -1)
-  [ -z "$LAN_PFX" ] || case "$AP_NET" in "$LAN_PFX".*) die "$SLOT: AP_NET LAN agiyla cakisiyor";; esac
+  [ -z "$LAN_PFX" ] || case "$AP_NET" in "$LAN_PFX".*) die "$SLOT: AP_NET collides with the LAN network";; esac
   WGCONF=/etc/wireguard/${WG_IF}.conf
   if [ -r "$WGCONF" ]; then
-    grep -qiE '^[[:space:]]*Table[[:space:]]*=[[:space:]]*off' "$WGCONF" || die "$WGCONF icinde 'Table = off' yok"
-    grep -qiE '^[[:space:]]*DNS[[:space:]]*=' "$WGCONF" && die "$WGCONF icinde DNS= var (resolv.conf'u ezer)"
+    grep -qiE '^[[:space:]]*Table[[:space:]]*=[[:space:]]*off' "$WGCONF" || die "$WGCONF has no 'Table = off'"
+    grep -qiE '^[[:space:]]*DNS[[:space:]]*=' "$WGCONF" && die "$WGCONF contains DNS= (it would overwrite resolv.conf)"
   fi
   WG_SRC=$($IP -4 -o addr show dev "$WG_IF" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
   if [ -z "${WG_SRC:-}" ] && [ -r "$WGCONF" ]; then
@@ -52,31 +52,31 @@ load_slot(){
   MSS=$((WG_MTU - 40))
 }
 
-# ------------------------------------------------------------- 1. zincirler (bir kez)
+# ------------------------------------------------------------- 1. chains (once)
 mkchain filter AP-VPN-FWD; mkchain filter AP-VPN-IN
 mkchain nat AP-VPN-POST;   mkchain nat AP-VPN-PRE
 mkchain mangle AP-VPN-MSS
 $SYSCTL -qw net.ipv4.ip_forward=1
 
-# eski tek-slot kurallarini (tum "from ... lookup/blackhole" kurallarimizi) temizle
+# clear our old rules (every "from ... lookup/blackhole" rule in our priority range)
 $IP rule show | awk -F: '$1>=1000 && $1<2000 {print $1}' | sort -u | while read -r pref; do
   while $IP rule del pref "$pref" 2>/dev/null; do :; done
 done
 
-# ------------------------------------------------------------- 2. slot basina kurallar
+# ------------------------------------------------------------- 2. per-slot rules
 ACTIVE=""
 for f in $SLOT_FILES; do
   load_slot "$f"
-  [ "$ENABLED" = 1 ] || { logger -t ap-firewall "$SLOT devre disi, atlandi"; continue; }
+  [ "$ENABLED" = 1 ] || { logger -t ap-firewall "$SLOT is disabled, skipped"; continue; }
   ACTIVE="$ACTIVE $SLOT"
 
-  # sysctl (sadece bu slotun arayuzleri)
+  # sysctl (only this slot's interfaces)
   $SYSCTL -qw "net.ipv4.conf.$AP_IF.rp_filter=2" 2>/dev/null || true
   $SYSCTL -qw "net.ipv4.conf.$WG_IF.rp_filter=2" 2>/dev/null || true
   $SYSCTL -qw "net.ipv6.conf.$AP_IF.disable_ipv6=1" 2>/dev/null || true
   $SYSCTL -qw "net.ipv6.conf.$AP_IF.accept_ra=0" 2>/dev/null || true
 
-  # routing: once AP'nin yerel rotasi (dnsmasq cevaplari tunele gitmesin), sonra default
+  # routing: the AP's link route first (so dnsmasq replies do not go into the tunnel), then the default
   $IP route replace "$AP_NET" dev "$AP_IF" scope link src "$AP_GW" table "$TABLE" 2>/dev/null || true
   if $IP link show "$WG_IF" >/dev/null 2>&1; then
     $IP route replace default dev "$WG_IF" scope link table "$TABLE" 2>/dev/null || true
@@ -86,47 +86,48 @@ for f in $SLOT_FILES; do
   $IP rule add from "$AP_NET" blackhole priority "$PRIO_BLACKHOLE"      || die "$SLOT: blackhole"
   [ -n "${WG_SRC:-}" ] && $IP rule add from "$WG_SRC" blackhole priority "$PRIO_BLACKHOLE"
 
-  # NAT + DNS zorlama
+  # NAT + forced DNS
   $IPT -t nat -A AP-VPN-POST -s "$AP_NET" -o "$WG_IF" -j MASQUERADE
   $IPT -t nat -A AP-VPN-PRE -i "$AP_IF" -p udp --dport 53 -j REDIRECT --to-ports 53
   $IPT -t nat -A AP-VPN-PRE -i "$AP_IF" -p tcp --dport 53 -j REDIRECT --to-ports 53
 
-  # MSS (iki yonde sabit, bu tunelin MTU'sundan)
+  # MSS (fixed in both directions, derived from this tunnel's MTU)
   $IPT -t mangle -A AP-VPN-MSS -o "$WG_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS"
   $IPT -t mangle -A AP-VPN-MSS -i "$WG_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS"
 
-  # FORWARD: ozel aglar DROP -> kendi tuneline ACCEPT -> geri donus ACCEPT -> HER SEY DROP
+  # FORWARD: private networks DROP -> own tunnel ACCEPT -> return traffic ACCEPT -> EVERYTHING DROP
   for N in 192.168.0.0/16 172.16.0.0/12 10.0.0.0/8 169.254.0.0/16 100.64.0.0/10; do
     $IPT -A AP-VPN-FWD -i "$AP_IF" -d "$N" -j DROP
   done
   $IPT -A AP-VPN-FWD -i "$AP_IF" -o "$WG_IF" -j ACCEPT
   $IPT -A AP-VPN-FWD -i "$WG_IF" -o "$AP_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-  $IPT -A AP-VPN-FWD -i "$AP_IF" -j DROP                 # KILLSWITCH + capraz-slot + LAN izolasyonu
-  $IPT -A AP-VPN-FWD -i "$WG_IF" -o "$AP_IF" -j DROP     # tunelden ice yeni baglanti yok
+  $IPT -A AP-VPN-FWD -i "$AP_IF" -j DROP                 # KILL SWITCH + cross-slot + LAN isolation
+  $IPT -A AP-VPN-FWD -i "$WG_IF" -o "$AP_IF" -j DROP     # no new inbound connections from the tunnel
   $IPT -A AP-VPN-FWD -i "$LAN_IF" -o "$AP_IF" -j DROP
 
-  # INPUT: sadece DHCP + DNS + ping
+  # INPUT: DHCP + DNS + ping only
   $IPT -A AP-VPN-IN -i "$AP_IF" -p udp --dport 67 -j ACCEPT
   $IPT -A AP-VPN-IN -i "$AP_IF" -p udp --dport 53 -j ACCEPT
   $IPT -A AP-VPN-IN -i "$AP_IF" -p tcp --dport 53 -j ACCEPT
   $IPT -A AP-VPN-IN -i "$AP_IF" -p icmp --icmp-type echo-request -j ACCEPT
   $IPT -A AP-VPN-IN -i "$AP_IF" -j DROP
 done
-[ -n "$ACTIVE" ] || die "etkin slot yok"
+[ -n "$ACTIVE" ] || die "no enabled slots"
 
-# tunel tarafi (VPN sunucusu) Pi'ye YENI baglanti acamaz (web paneli 8443, SSH vb. tunelden gorunmez).
-# ESTABLISHED/RELATED (dnsmasq upstream DNS cevaplari, exit-ip curl) etkilenmez. ICMP echo serbest.
+# The tunnel side (the VPN server) cannot open NEW connections to the Pi (the web panel on 8443,
+# SSH and so on are invisible from the tunnel). ESTABLISHED/RELATED traffic (upstream DNS replies,
+# the exit-IP curl) is unaffected. ICMP echo stays allowed.
 $IPT -A AP-VPN-IN -i wg+ -p icmp --icmp-type echo-request -j ACCEPT
 $IPT -A AP-VPN-IN -i wg+ -m conntrack --ctstate NEW -j DROP
 
-# ------------------------------------------------------------- 3. bagla
+# ------------------------------------------------------------- 3. hook up
 hook filter DOCKER-USER AP-VPN-FWD
 hook filter INPUT       AP-VPN-IN
 hook nat    POSTROUTING AP-VPN-POST
 hook nat    PREROUTING  AP-VPN-PRE
 hook mangle FORWARD     AP-VPN-MSS
 
-# ------------------------------------------------------------- 4. IPv6 (tum AP arayuzleri)
+# ------------------------------------------------------------- 4. IPv6 (all AP interfaces)
 $IP6T -N AP-VPN-6 2>/dev/null || $IP6T -F AP-VPN-6
 for f in $SLOT_FILES; do
   load_slot "$f"; [ "$ENABLED" = 1 ] || continue
@@ -135,11 +136,11 @@ done
 $IP6T -C INPUT   -j AP-VPN-6 2>/dev/null || $IP6T -I INPUT   1 -j AP-VPN-6
 $IP6T -C FORWARD -j AP-VPN-6 2>/dev/null || $IP6T -I FORWARD 1 -j AP-VPN-6
 
-# ------------------------------------------------------------- 5. self-check (slot basina)
+# ------------------------------------------------------------- 5. self-check (per slot)
 fail=""
 $IPT -C DOCKER-USER -j AP-VPN-FWD 2>/dev/null || fail="$fail DOCKER-USER-hook"
 $IPT -C INPUT -j AP-VPN-IN        2>/dev/null || fail="$fail INPUT-hook"
-$IPT -C AP-VPN-IN -i wg+ -m conntrack --ctstate NEW -j DROP 2>/dev/null || fail="$fail tunel-input-drop"
+$IPT -C AP-VPN-IN -i wg+ -m conntrack --ctstate NEW -j DROP 2>/dev/null || fail="$fail tunnel-input-drop"
 for f in $SLOT_FILES; do
   load_slot "$f"; [ "$ENABLED" = 1 ] || continue
   $IPT -C AP-VPN-FWD -i "$AP_IF" -j DROP                       2>/dev/null || fail="$fail $SLOT:killswitch"
@@ -150,13 +151,13 @@ for f in $SLOT_FILES; do
   $IP rule show | grep -q "from ${AP_NET} blackhole"             || fail="$fail $SLOT:blackhole"
   $IP route show table "$TABLE" | grep -q "^${AP_NET} dev ${AP_IF}" || fail="$fail $SLOT:ap-route"
   [ "$($IPT -t mangle -S AP-VPN-MSS | grep -c "$WG_IF .*set-mss $MSS")" = 2 ] || fail="$fail $SLOT:mss"
-  # CAPRAZ SLOT: bu slotun AP'sinden BASKA bir tunele ACCEPT olmamali
+  # CROSS-SLOT: there must be no ACCEPT from this slot's AP into ANOTHER tunnel
   for g in $SLOT_FILES; do
     OTHER_WG=$(sed -n 's/^WG_IF=//p' "$g"); [ "$OTHER_WG" = "$WG_IF" ] && continue
-    $IPT -C AP-VPN-FWD -i "$AP_IF" -o "$OTHER_WG" -j ACCEPT 2>/dev/null && fail="$fail $SLOT:CAPRAZ($OTHER_WG)"
+    $IPT -C AP-VPN-FWD -i "$AP_IF" -o "$OTHER_WG" -j ACCEPT 2>/dev/null && fail="$fail $SLOT:CROSS($OTHER_WG)"
   done
 done
-[ -z "$fail" ] || die "self-check basarisiz:$fail"
-logger -t ap-firewall "v4 uygulandi, slotlar:$ACTIVE"
-echo "ap-firewall: OK slotlar:$ACTIVE"
+[ -z "$fail" ] || die "self-check failed:$fail"
+logger -t ap-firewall "rules applied, slots:$ACTIVE"
+echo "ap-firewall: OK slots:$ACTIVE"
 exit 0

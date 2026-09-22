@@ -1,5 +1,5 @@
 [Unit]
-Description=AP-VPN tunel watchdog (kurtarma, koruma degil)
+Description=AP-VPN tunnel watchdog (recovery, not protection)
 After=ap-firewall.service
 ConditionPathExists=!/etc/ap-vpn/DISABLED
 

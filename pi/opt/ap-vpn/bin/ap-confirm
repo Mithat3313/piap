@@ -1,6 +1,6 @@
 #!/bin/bash
-# ap-armed ile kurulan geri alma sayacini iptal eder.
+# Cancels the rollback timer armed by ap-armed.
 touch /run/ap-confirmed
 systemctl stop ap-rollback.timer 2>/dev/null
 systemctl reset-failed ap-rollback.timer ap-rollback.service 2>/dev/null
-echo "ONAYLANDI - geri alma iptal edildi."
+echo "CONFIRMED - rollback cancelled."

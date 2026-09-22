@@ -1,6 +1,6 @@
 #!/bin/bash
-# /opt/ap-vpn/bin/ap-verify.sh - her iddiayi ciktisi kanit olan bir komuta cevirir.
-# SALT OKUNUR. Hicbir FAIL yoksa exit 0.
+# /opt/ap-vpn/bin/ap-verify.sh - turns every claim into a command whose output is the proof.
+# READ-ONLY. Exits 0 when there is no FAIL.
 set -u
 . /etc/ap-vpn/ap.env
 SLOT=ap0; for _a in "$@"; do case "$_a" in --slot=*) SLOT="${_a#--slot=}";; esac; done; [ -r "/etc/ap-vpn/slots/$SLOT.env" ] && . "/etc/ap-vpn/slots/$SLOT.env"; export SLOT
@@ -12,117 +12,120 @@ P(){ printf '  PASS  %s\n' "$1"; p=$((p+1)); }
 F(){ printf '  FAIL  %s\n' "$1"; f=$((f+1)); }
 H(){ printf '\n== %s ==\n' "$1"; }
 
-H "1. HOST YOLU DOKUNULMADI (en sert kisit)"
+H "1. HOST PATH UNTOUCHED (the hardest constraint)"
 ip route get 1.1.1.1 2>&1 | grep -q "dev $LAN_IF" \
-  && P "Pi'nin kendi default rotasi hala $LAN_IF" \
-  || F "HOST ELE GECIRILDI: $(ip route get 1.1.1.1 2>&1) - Pi'nin kendi servisleri etkilenir"
+  && P "the Pi's own default route is still $LAN_IF" \
+  || F "HOST HIJACKED: $(ip route get 1.1.1.1 2>&1) - the Pi's own services are affected"
 ip -4 route show table main | grep -qw "$WG_IF" \
-  && F "table main icinde $WG_IF rotasi var (Table=off tutmamis)" \
-  || P "table main'de $WG_IF yok"
+  && F "table main contains a $WG_IF route (Table=off did not hold)" \
+  || P "no $WG_IF route in table main"
 $WG show "$WG_IF" fwmark 2>/dev/null | grep -qv off \
-  && F "wg-quick fwmark kurmus" || P "fwmark yok (Table=off dogru)"
+  && F "wg-quick installed an fwmark" || P "no fwmark (Table=off is in effect)"
 [ "$(/usr/sbin/sysctl -n net.ipv4.conf.all.src_valid_mark 2>/dev/null)" = 0 ] \
-  && P "src_valid_mark hala 0" || F "src_valid_mark degismis"
+  && P "src_valid_mark is still 0" || F "src_valid_mark was changed"
 grep -q "$LAN_GW" /etc/resolv.conf \
-  && P "host resolv.conf hala $LAN_GW" || F "host resolv.conf degismis (wg-quick DNS= ezmis olabilir)"
-# Pi'nin kendi servisleri: ap.env icinde HOST_CHECKS="http:8123 tcp:1883" gibi (bos = atla)
+  && P "host resolv.conf still points at $LAN_GW" || F "host resolv.conf changed (a wg-quick DNS= may have overwritten it)"
+# The Pi's own services: set HOST_CHECKS="http:8123 tcp:1883" in ap.env (empty = skip)
 for hc in ${HOST_CHECKS:-}; do
   hp=${hc##*:}
   case "$hc" in
-    http:*) curl -s -o /dev/null -m 8 "http://${LAN_IP}:${hp}/" && P "host http:$hp LAN'dan cevap veriyor" || F "host http:$hp cevap vermiyor";;
-    tcp:*)  /usr/bin/ss -lntH "sport = :$hp" | grep -q ":$hp" && P "host tcp:$hp dinliyor" || F "host tcp:$hp dinlemiyor";;
+    http:*) curl -s -o /dev/null -m 8 "http://${LAN_IP}:${hp}/" && P "host http:$hp answers on the LAN address" || F "host http:$hp does not answer";;
+    tcp:*)  /usr/bin/ss -lntH "sport = :$hp" | grep -q ":$hp" && P "host tcp:$hp is listening" || F "host tcp:$hp is not listening";;
   esac
 done
 if command -v docker >/dev/null 2>&1; then
   [ "$($IPT -t nat -S POSTROUTING | grep -c '172.17.0.0/16')" = 1 ] \
-    && P "Docker masquerade bozulmamis" || F "Docker masquerade sayisi beklenmedik"
+    && P "Docker masquerade intact" || F "unexpected number of Docker masquerade rules"
 fi
 
-H "2. MISAFIR YOLU SADECE TUNELDEN"
+H "2. GUEST PATH GOES THROUGH THE TUNNEL ONLY"
 $IP rule show | grep -q "^${PRIO_APNET}:.*from ${AP_NET} lookup ${TABLE}" \
-  && P "rule ${PRIO_APNET} ($AP_NET -> $TABLE)" || F "rule ${PRIO_APNET} YOK"
+  && P "rule ${PRIO_APNET} ($AP_NET -> $TABLE)" || F "rule ${PRIO_APNET} MISSING"
 $IP rule show | grep -q "from ${AP_NET} blackhole" \
-  && P "blackhole kurali VAR (bos tablo main'e DUSMEZ)" \
-  || F "BLACKHOLE YOK = SIZINTI. Bos tablo kural degerlendirmesini durdurmaz, paket main'e ve ISP'ye duser."
+  && P "blackhole rule present (an empty table does NOT fall through to main)" \
+  || F "NO BLACKHOLE = LEAK. An empty table does not stop rule evaluation; the packet falls through to main and the ISP."
 $IP route show table "$TABLE" | grep -q "^${AP_NET} dev ${AP_IF}" \
-  && P "AP link rotasi tabloda (dnsmasq cevaplari tunele gitmiyor)" \
-  || F "AP link rotasi YOK - istemciler isim cozemez"
+  && P "AP link route is in the table (dnsmasq replies do not enter the tunnel)" \
+  || F "AP link route MISSING - clients cannot resolve names"
 if $IP link show "$WG_IF" >/dev/null 2>&1; then
   ip route get 1.1.1.1 from "$AP_TEST_SRC" iif "$AP_IF" 2>&1 | grep -q "dev $WG_IF" \
-    && P "misafir kaynakli paket $WG_IF'e gidiyor" \
-    || F "misafir paketi $WG_IF'e GITMIYOR: $(ip route get 1.1.1.1 from $AP_TEST_SRC iif $AP_IF 2>&1)"
+    && P "a guest-sourced packet is routed to $WG_IF" \
+    || F "a guest packet does NOT reach $WG_IF: $(ip route get 1.1.1.1 from $AP_TEST_SRC iif $AP_IF 2>&1)"
 else
-  echo "  INFO  $WG_IF yok - misafir trafigi blackhole'da (kill-switch calisiyor)"
+  echo "  INFO  $WG_IF is absent - guest traffic sits in the blackhole (the kill switch is working)"
 fi
 ip route get "$AP_TEST_SRC" from "$AP_GW" 2>&1 | grep -q "dev $AP_IF" \
-  && P "AP->AP cevaplari $AP_IF'te kaliyor" || F "AP->AP cevaplari yanlis yolda"
-$IPT -C DOCKER-USER -j AP-VPN-FWD 2>/dev/null && P "DOCKER-USER -> AP-VPN-FWD bagli" || F "DOCKER-USER hook YOK"
-$IPT -C AP-VPN-FWD -i "$AP_IF" -j DROP 2>/dev/null && P "kill-switch filtre kurali var" || F "kill-switch filtre kurali YOK"
+  && P "AP->AP replies stay on $AP_IF" || F "AP->AP replies take the wrong path"
+$IPT -C DOCKER-USER -j AP-VPN-FWD 2>/dev/null && P "DOCKER-USER -> AP-VPN-FWD hooked" || F "DOCKER-USER hook MISSING"
+$IPT -C AP-VPN-FWD -i "$AP_IF" -j DROP 2>/dev/null && P "kill-switch filter rule present" || F "kill-switch filter rule MISSING"
 $IPT -t nat -C AP-VPN-POST -s "$AP_NET" -o "$WG_IF" -j MASQUERADE 2>/dev/null \
-  && P "masquerade var" || F "masquerade YOK - dugum 10.99.0.x paketlerini atar"
+  && P "masquerade present" || F "masquerade MISSING - the far end drops packets from $AP_NET"
 NAT_PKT=$($IPT -t nat -vxnL AP-VPN-POST | awk '/MASQUERADE/{print $1; exit}')
-[ "${NAT_PKT:-0}" -gt 0 ] 2>/dev/null && P "masquerade sayaci ${NAT_PKT} paket (gercekten calisiyor)" \
-  || echo "  INFO  masquerade sayaci 0 - misafir trafigi uret ve tekrar calistir"
+[ "${NAT_PKT:-0}" -gt 0 ] 2>/dev/null && P "masquerade counter at ${NAT_PKT} packets (it is really in use)" \
+  || echo "  INFO  masquerade counter is 0 - generate some guest traffic and run again"
 
-H "3. RP_FILTER (1 OLMAMALI)"
+H "3. RP_FILTER (MUST NOT BE 1)"
 bad=0
 for k in all default "$AP_IF" "$WG_IF" "$LAN_IF"; do
   v=$(/usr/sbin/sysctl -n "net.ipv4.conf.$k.rp_filter" 2>/dev/null)
-  printf '       %-8s = %s\n' "$k" "${v:-yok}"
+  printf '       %-8s = %s\n' "$k" "${v:-n/a}"
   [ "${v:-0}" = 1 ] && bad=1
 done
-[ $bad = 0 ] && P "rp_filter hicbir yerde 1 degil" \
-  || F "rp_filter=1 (STRICT): $WG_IF'ten donen trafik sessizce dusar; semptom 'handshake taze, hicbir sey calismiyor'"
+[ $bad = 0 ] && P "rp_filter is not 1 anywhere" \
+  || F "rp_filter=1 (STRICT): traffic returning from $WG_IF is dropped silently; the symptom is 'handshake fresh, nothing works'"
 
 H "4. MSS / MTU"
 M=$(cat /sys/class/net/$WG_IF/mtu 2>/dev/null); EXP=$((${M:-1420}-40))
-printf '       %s mtu=%s beklenen mss=%s\n' "$WG_IF" "${M:-yok}" "$EXP"
+printf '       %s mtu=%s expected mss=%s\n' "$WG_IF" "${M:-n/a}" "$EXP"
 [ "$($IPT -t mangle -S AP-VPN-MSS | grep -c "$WG_IF .*set-mss $EXP")" = 2 ] \
-  && P "MSS iki yonde de $EXP (canli MTU'dan turetildi)" \
-  || F "MSS clamp yanlis/eksik: buyuk HTTPS indirmeleri sessizce takilir"
+  && P "MSS is $EXP in both directions (derived from the live MTU)" \
+  || F "MSS clamp wrong or missing: large HTTPS downloads stall silently"
 
-H "5. IPv6 KAPALI"
+H "5. IPv6 DISABLED"
 [ "$(/usr/sbin/sysctl -n net.ipv6.conf.$AP_IF.disable_ipv6 2>/dev/null)" = 1 ] \
-  && P "$AP_IF uzerinde IPv6 kapali" || F "$AP_IF uzerinde IPv6 ACIK - v4 kill-switch'in kapsamadigi yol"
+  && P "IPv6 is disabled on $AP_IF" || F "IPv6 is ENABLED on $AP_IF - a path the v4 kill switch does not cover"
 [ -z "$($IP -6 addr show dev $AP_IF 2>/dev/null | grep inet6)" ] \
-  && P "$AP_IF'te IPv6 adresi yok" || F "$AP_IF'te IPv6 adresi var"
-[ "$($IP6T -S INPUT   | grep -c 'AP-VPN v6-in')"  = 0 ] && P "ip6 INPUT'ta artik kayit yok"  || F "ip6 INPUT'ta v1 artigi kaldi"
-[ "$($IP6T -S FORWARD | grep -c 'AP-VPN v6-fwd')" = 0 ] && P "ip6 FORWARD'da artik kayit yok" || F "ip6 FORWARD'da v1 artigi kaldi"
-$IP6T -C INPUT -j AP-VPN-6 2>/dev/null && P "AP-VPN-6 zinciri bagli" || F "AP-VPN-6 bagli degil"
+  && P "no IPv6 address on $AP_IF" || F "$AP_IF has an IPv6 address"
+$IP6T -C INPUT   -j AP-VPN-6 2>/dev/null && P "AP-VPN-6 hooked into ip6 INPUT"   || F "AP-VPN-6 is not hooked into ip6 INPUT"
+$IP6T -C FORWARD -j AP-VPN-6 2>/dev/null && P "AP-VPN-6 hooked into ip6 FORWARD" || F "AP-VPN-6 is not hooked into ip6 FORWARD"
+[ "$($IP6T -S AP-VPN-6 2>/dev/null | grep -c -- "-i $AP_IF -j DROP")" = 1 ] \
+  && P "ip6 DROP rule for $AP_IF" || F "no ip6 DROP rule for $AP_IF"
 
-H "6. MISAFIR IZOLASYONU (Pi servisleri)"
+H "6. GUEST ISOLATION (the Pi's services)"
 $IPT -C AP-VPN-IN -i "$AP_IF" -j DROP 2>/dev/null \
-  && P "AP-VPN-IN sonunda DROP (SSH, web, MQTT, mDNS vb. kapali)" || F "INPUT DROP YOK"
+  && P "AP-VPN-IN ends with DROP (SSH, web panel, MQTT, mDNS and so on are closed)" || F "INPUT DROP MISSING"
 for pr in 67:udp 53:udp 53:tcp; do
   pt=${pr%%:*}; pp=${pr##*:}
   $IPT -C AP-VPN-IN -i "$AP_IF" -p "$pp" --dport "$pt" -j ACCEPT 2>/dev/null \
-    && P "DROP oncesi $pp/$pt ACCEPT var" || F "$pp/$pt ACCEPT eksik - istemci lease/DNS alamaz"
+    && P "$pp/$pt ACCEPT present before the DROP" || F "$pp/$pt ACCEPT missing - clients get no lease or no DNS"
 done
 grep -qE '^\s*ap_isolate=1' /etc/hostapd/$SLOT.conf \
-  && P "hostapd ap_isolate=1 (istemci-istemci radyoda engelli)" \
-  || F "ap_isolate!=1 - misafirler birbirine ulasir, firewall bunu goremez (L2, IP yiginina hic girmez)"
-grep -qE '^\s*deny-interfaces=wlan0' /etc/avahi/avahi-daemon.conf \
-  && P "avahi wlan0'a duyuru yapmiyor" || F "avahi wlan0'da - misafire tum LAN envanterini verir"
+  && P "hostapd ap_isolate=1 (client-to-client blocked in the radio)" \
+  || F "ap_isolate!=1 - guests can reach each other and the firewall cannot see it (L2, it never enters the IP stack)"
+if [ -f /etc/avahi/avahi-daemon.conf ]; then
+  grep -qE "^\s*deny-interfaces=.*\b${AP_IF}\b" /etc/avahi/avahi-daemon.conf \
+    && P "avahi does not announce on $AP_IF" || F "avahi is active on $AP_IF - it would hand guests the whole LAN inventory"
+fi
 
-H "7. NFTABLES SERVISI (KAPALI KALMALI)"
+H "7. NFTABLES SERVICE (MUST STAY DISABLED)"
 [ "$(systemctl is-enabled nftables 2>/dev/null)" = disabled ] \
   && P "nftables.service disabled" \
-  || F "nftables.service enabled: /etc/nftables.conf 'flush ruleset' ile basliyor, Docker'in TUM tablolarini ve kill-switch'i siler"
+  || F "nftables.service enabled: /etc/nftables.conf starts with 'flush ruleset' and wipes ALL of Docker's tables and the kill switch"
 
-H "8. TUNEL SAGLIGI"
+H "8. TUNNEL HEALTH"
 if $WG show "$WG_IF" >/dev/null 2>&1; then
   now=$(date +%s); best=999999
   while read -r _k t; do [ -n "${t:-}" ] || continue; [ "$t" = 0 ] && continue
     a=$((now-t)); [ $a -lt $best ] && best=$a; done < <($WG show "$WG_IF" latest-handshakes)
   [ $best -lt 999999 ] && [ $best -le "$HS_MAX_AGE" ] \
-    && P "handshake ${best}s once (<= ${HS_MAX_AGE}s)" \
-    || F "handshake ${best}s - BAYAT (veya hic olmamis)"
+    && P "handshake ${best}s ago (<= ${HS_MAX_AGE}s)" \
+    || F "handshake ${best}s - STALE (or it never happened)"
   $WG show "$WG_IF" transfer | sed 's/^/       /'
 else
-  echo "  INFO  $WG_IF yok"
+  echo "  INFO  $WG_IF is absent"
 fi
 
-H "9. KALICILIK"
+H "9. PERSISTENCE"
 bad=0
 for u in ap-wlan@$SLOT ap-firewall $HOSTAPD_UNIT $DNSMASQ_UNIT wg-quick@$WG_IF ap-watchdog.timer ap-bootcheck.timer; do
   e=$(systemctl is-enabled "$u" 2>&1); a=$(systemctl is-active "$u" 2>&1)
@@ -130,16 +133,16 @@ for u in ap-wlan@$SLOT ap-firewall $HOSTAPD_UNIT $DNSMASQ_UNIT wg-quick@$WG_IF a
   case "$e" in enabled|enabled-runtime|static) :;; *) bad=1;; esac
   case "$u" in *timer) :;; *) [ "$a" = active ] || bad=1;; esac
 done
-[ $bad = 0 ] && P "her unit enabled ve calisiyor" || F "en az bir unit enabled/active degil - reboot'ta geri gelmez"
+[ $bad = 0 ] && P "every unit is enabled and running" || F "at least one unit is not enabled/active - it will not come back after a reboot"
 systemctl --failed --no-legend | sed 's/^/       /'
 
-H "10. ATAMA SABITLEME (SSID <-> profil <-> sunucu anahtari <-> radyo)"
-msg=$(/opt/ap-vpn/bin/ap-pin.sh check "$SLOT") && P "sabit tutuyor: $msg" || F "SABIT IHLALI: $msg"
-grep -q '^PIN_PROFILE=.\+' "/etc/ap-vpn/slots/$SLOT.env" && P "slot sabitlenmis (PIN_PROFILE)" || F "slot sabitlenmemis: ap-ctl --slot $SLOT slot pin --confirm '<SSID>'"
-grep -q '^AP_MAC=.\+' "/etc/ap-vpn/slots/$SLOT.env" && P "radyo MAC sabit (AP_MAC)" || F "AP_MAC yok"
-grep -q 'ap-pin.sh check' /etc/systemd/system/ap-hostapd@.service && P "hostapd baslarken sabit denetimi (ExecStartPre)" || F "ap-hostapd@ sabit denetimi YOK"
-grep -q 'ap-pin.sh enforce' /opt/ap-vpn/bin/ap-watchdog.sh && P "watchdog 30 sn'de bir sabit uyguluyor" || F "watchdog enforce YOK"
-[ -f "/run/ap-vpn/$SLOT/pin-violation" ] && F "ihlal bayragi duruyor: $(cat /run/ap-vpn/$SLOT/pin-violation)" || P "ihlal bayragi yok"
+H "10. ASSIGNMENT PINNING (SSID <-> profile <-> server key <-> radio)"
+msg=$(/opt/ap-vpn/bin/ap-pin.sh check "$SLOT") && P "the pin holds: $msg" || F "PIN VIOLATION: $msg"
+grep -q '^PIN_PROFILE=.\+' "/etc/ap-vpn/slots/$SLOT.env" && P "the slot is pinned (PIN_PROFILE)" || F "the slot is not pinned: ap-ctl --slot $SLOT slot pin --confirm '<SSID>'"
+grep -q '^AP_MAC=.\+' "/etc/ap-vpn/slots/$SLOT.env" && P "radio MAC pinned (AP_MAC)" || F "AP_MAC missing"
+grep -q 'ap-pin.sh check' /etc/systemd/system/ap-hostapd@.service && P "pin check runs when hostapd starts (ExecStartPre)" || F "ap-hostapd@ has NO pin check"
+grep -q 'ap-pin.sh enforce' /opt/ap-vpn/bin/ap-watchdog.sh && P "the watchdog enforces the pin every cycle" || F "watchdog enforce MISSING"
+[ -f "/run/ap-vpn/$SLOT/pin-violation" ] && F "a violation flag is still present: $(cat /run/ap-vpn/$SLOT/pin-violation)" || P "no violation flag"
 
 printf '\n---- %d PASS, %d FAIL ----\n' "$p" "$f"
 [ "$f" -eq 0 ]
