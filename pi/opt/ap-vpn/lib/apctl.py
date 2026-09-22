@@ -428,8 +428,11 @@ def _pin_clear(s):
 def _require_confirm(confirm, *affected):
     """For operations that change the SSID-VPN mapping: the affected SSIDs, joined with ' / ',
     must be typed VERBATIM. Guards against a mis-click; the system NEVER makes this change on its own."""
-    expected = ' / '.join(_ssid_of(x) for x in affected)
-    if not expected.strip(' /'):
+    # Compare what a person can actually type: an SSID may carry leading or trailing spaces (hostapd
+    # keeps them verbatim), and demanding those back would make the slot impossible to confirm at all.
+    parts = [_ssid_of(x).strip() for x in affected]
+    expected = ' / '.join(parts)
+    if not all(parts):
         raise ApError('cannot read the SSID of ' + ', '.join(x['SLOT'] for x in affected) + ' - refusing to change anything')
     if str(confirm or '').strip() != expected:
         raise ApError(f'CONFIRMATION REQUIRED: this operation changes the SSID-VPN mapping. To confirm, type exactly: {expected}')

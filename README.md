@@ -83,7 +83,8 @@ pi/
   opt/ap-vpn/web/index.html   single-file panel
   opt/ap-vpn/templates/       ap.env, slot.env, dnsmasq, hostapd (5 / 2.4 GHz), NetworkManager
   systemd/                    ap-ifsync@, ap-wlan@, ap-dnsmasq@, ap-hostapd@, ap-firewall, ap-watchdog, ap-bootcheck, ap-web, ap-ble-agent
-tests/firewall-dryrun.sh      runs the firewall against mocked tools and asserts both exit modes
+tests/                        hardware-free dry runs: firewall-dryrun.sh (both exit modes, 44 assertions),
+                              device-dryrun.sh (re-plugs, swaps, foreign adapters), confirm-dryrun.sh
 macos/                        PiAP Manager — SwiftUI + CoreBluetooth (macOS 14+)
 docs/
   architecture.md             slot model, routing, firewall chains, self-checks

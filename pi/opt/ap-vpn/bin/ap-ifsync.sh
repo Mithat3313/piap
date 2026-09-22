@@ -86,6 +86,10 @@ set_key(){ # file key value
 }
 
 sync_slot(){
+  # Take the same lock the web panel and the BLE agent use for long operations: both write slot envs,
+  # and two independent read-modify-write cycles would drop one of the changes.
+  mkdir -p /run/ap-vpn 2>/dev/null
+  exec 8>>/run/ap-vpn/long.lock 2>/dev/null && flock -w 10 8 2>/dev/null || true
   local slot=$1 env="$SLOTS/$1.env" cur now owner
   [ -r "$env" ] || die "$slot: no slot env"
   # shellcheck disable=SC1090

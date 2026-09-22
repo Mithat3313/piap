@@ -135,8 +135,13 @@ for f in $SLOT_FILES; do
       $IP route replace default dev "$WG_IF" scope link table "$TABLE" 2>/dev/null || true
     fi
   else
-    # direct: the LAN default, and ONLY in a direct slot's own table
-    [ -n "${LAN_GW:-}" ] && $IP route replace default via "$LAN_GW" dev "$LAN_IF" table "$TABLE" 2>/dev/null || true
+    # direct: the LAN default, and ONLY in a direct slot's own table. A gateway outside the LAN's own
+    # subnet (some ISP routers hand one out) needs 'onlink', so fall back to that rather than silently
+    # leaving the table without a default - the self-check below refuses the run if neither worked.
+    if [ -n "${LAN_GW:-}" ]; then
+      $IP route replace default via "$LAN_GW" dev "$LAN_IF" table "$TABLE" 2>/dev/null \
+        || $IP route replace default via "$LAN_GW" dev "$LAN_IF" onlink table "$TABLE" 2>/dev/null || true
+    fi
   fi
   [ -n "${WG_SRC:-}" ] && $IP rule add from "$WG_SRC" lookup "$TABLE" priority "$PRIO_WGSRC"
   $IP rule add from "$AP_NET" lookup "$TABLE" priority "$PRIO_APNET"   || die "$SLOT: rule $PRIO_APNET"
