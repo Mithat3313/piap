@@ -75,7 +75,7 @@ sudo ap-ctl --slot ap1 verify
 
 ## 5. Channel and band notes
 
-- The built-in radio (CYW43455) can run one AP at a time; on 5 GHz the non-DFS channels are 36–48 in most countries. Channel 1 was the emptiest on 2.4 GHz here; adjust with `--channel` for your environment.
+- The built-in radio (CYW43455) can run one AP at a time; on 5 GHz the non-DFS channels are 36–48 in most countries. On 2.4 GHz the default is channel 11: channel 1 overlaps Bluetooth LE advertising and was measured losing 22% of frames here against 0.4% on 11. Adjust with `--channel` for your environment (see troubleshooting for how to measure).
 - The RT5370 is 2.4 GHz only; use an MT7612U (mt76) for a second 5 GHz SSID.
 - The templates use 80 MHz on 5 GHz and 20 MHz on 2.4 GHz; edit `/etc/hostapd/<slot>.conf` and `sudo systemctl restart ap-hostapd@<slot>` to change. Do not edit the SSID by hand — the pin will no longer match and the SSID stops; use `ap-ctl --slot apN wifi set --ssid …` instead.
 

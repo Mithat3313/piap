@@ -4,7 +4,7 @@
 #    sudo ap-slot-new.sh <slot> <interface|MAC> <5|2.4> [--ssid NAME] [--psk PASSWORD] [--channel N]
 #                        [--country XX] [--net 10.99.0] [--desc "description"] [--mode vpn|direct]
 #    e.g.  sudo ap-slot-new.sh ap0 wlan0 5          (built-in radio, 5 GHz channel 36)
-#          sudo ap-slot-new.sh ap1 wlan1 2.4        (USB adapter, 2.4 GHz channel 1)
+#          sudo ap-slot-new.sh ap1 wlan1 2.4        (USB adapter, 2.4 GHz channel 11)
 #  The slot is bound to the RADIO (its MAC is written as AP_MAC), not to the interface name: plugging
 #  the adapter into another port keeps this slot, and a DIFFERENT adapter never inherits it - it gets
 #  its own slot, which is the point: another device means another network and another exit.
@@ -59,7 +59,10 @@ while [ $# -gt 0 ]; do case "$1" in
 case "$MODE" in vpn|direct) :;; *) die "--mode must be vpn or direct";; esac
 case "$BAND" in
   5)   TPL=hostapd-5ghz.conf;  CHANNEL=${CHANNEL:-36};;
-  2.4) TPL=hostapd-24ghz.conf; CHANNEL=${CHANNEL:-1};;
+  # 2.4 GHz defaults to 11, not 1: channel 1 overlaps BLE advertising channel 37 (2402 MHz, and the Pi's
+  # own Bluetooth antenna sits centimetres from a USB adapter) and is usually the most crowded. Measured
+  # on a real install: 22% of frames to a client failed on 1, 0.4% on 11. Override with --channel.
+  2.4) TPL=hostapd-24ghz.conf; CHANNEL=${CHANNEL:-11};;
   *) die "band must be 5 or 2.4";;
 esac
 case "$CHANNEL" in 36|40|44|48) SEG0=42;; 52|56|60|64) SEG0=58;; 100|104|108|112) SEG0=106;;

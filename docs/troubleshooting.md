@@ -42,6 +42,16 @@ Docker may recreate the `DOCKER-USER` chain. Fix: `docker.service.d/10-ap-firewa
 
 ## Radio
 
+**Very slow on a 2.4 GHz SSID, especially downloads**
+
+Measured case: a client 1 m away at −49 dBm and MCS 7 got 0.38 Mbit/s down, while the same tunnel gave 14–21 Mbit/s from the Pi itself. The link rate looked perfect; the frames were not arriving. `iw dev wlan1 station dump` showed it: `tx failed` climbing to 22–40% of `tx packets`, nearly one retry per frame. Downloads suffer most because that is the direction the AP transmits.
+
+The cause was the channel. Channel 1 was busy about half the time, and it also overlaps Bluetooth LE advertising channel 37 (2402 MHz) — with the Pi's own Bluetooth antenna a few centimetres from the USB adapter. Measure rather than guess: switch the slot's channel, give it 30 seconds with the client active, and compare the `tx failed` / `tx packets` ratio. On that install: channel 1 → 22.1%, channel 6 → 0.7%, channel 11 → 0.4%. New 2.4 GHz slots now default to 11.
+
+To change it: edit `channel=` in `/etc/hostapd/<slot>.conf`, then `sudo systemctl restart ap-hostapd@<slot>` and `sudo /opt/ap-vpn/bin/ap-firewall.sh` (the restart drops the AP's link route from the slot's table; the firewall puts it back). The channel is not part of the pin, so no confirmation is needed.
+
+Also rule out the line itself: `curl --interface <tunnel address>` against a speed-test file from the Pi measures the tunnel with no Wi‑Fi involved, and the same without `--interface` measures the home line.
+
 **hostapd does not start on 5 GHz**
 
 Depends on the country code; in TR the non-DFS channels are 36–48. Check the regulatory domain with `iw reg get` and channel permissions with `iw list`. `country_code` must be in the hostapd conf (`ieee80211d=1`).
